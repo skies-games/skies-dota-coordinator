@@ -1,0 +1,6 @@
+/target
+.env
+bots_statistics.json
+bots_play_time.json
+logs/
+*.log
