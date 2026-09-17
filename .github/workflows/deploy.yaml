@@ -1,0 +1,29 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  SSH_USER: root
+  DEPLOY_PATH: /root/skies-dota-coordinator
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.IP }}
+          username: ${{ env.SSH_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            set -euo pipefail
+            source "$HOME/.cargo/env"
+            cd "${{ env.DEPLOY_PATH }}"
+            git fetch origin main
+            git reset --hard origin/main
+            cargo build --release
+            sudo systemctl restart coordinator.service
+            systemctl is-active --quiet coordinator.service
