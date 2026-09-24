@@ -10,8 +10,8 @@ use rand::prelude::SliceRandom;
 use rand::RngExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use async_channel::{Sender, Receiver};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
@@ -310,23 +310,13 @@ impl Bot {
 }
 
 struct Senders {
-    reconnect_handshake: Arc<Sender<ReconnectHandshake>>,
-    lobby_found: Arc<Sender<LobbyFound>>,
-    in_game_parameters: Arc<Sender<InGameParameters>>,
-    game_aborted: Arc<Sender<GameAborted>>,
-    in_game_event: Arc<Sender<InGameEvent>>,
-    game_ended: Arc<Sender<GameEnded>>,
-    user_command: Arc<Sender<UserCommand>>
-}
-
-struct Receivers {
-    reconnect_handshake: Arc<Receiver<ReconnectHandshake>>,
-    lobby_found: Arc<Receiver<LobbyFound>>,
-    in_game_parameters: Arc<Receiver<InGameParameters>>,
-    game_aborted: Arc<Receiver<GameAborted>>,
-    in_game_event: Arc<Receiver<InGameEvent>>,
-    game_ended: Arc<Receiver<GameEnded>>,
-    user_command: Arc<Receiver<UserCommand>>
+    reconnect_handshake: Sender<ReconnectHandshake>,
+    lobby_found: Sender<LobbyFound>,
+    in_game_parameters: Sender<InGameParameters>,
+    game_aborted: Sender<GameAborted>,
+    in_game_event: Sender<InGameEvent>,
+    game_ended: Sender<GameEnded>,
+    user_command: Sender<UserCommand>,
 }
 
 fn bot_streak_score(results: &[MatchResult]) -> i8 {
@@ -443,35 +433,34 @@ async fn main() {
 
     tracing::info!("Starting the coordinator");
     if let Ok(tcp_listener) = TcpListener::bind(format!("{}:8080", app_config.coordinator_server_ip)).await {
-        let (reconnect_handshake_sender, reconnect_handshake_receiver) = async_channel::bounded(CHANNEL_CAP_HOT);
-        let (lobby_found_sender, lobby_found_receiver) = async_channel::bounded(CHANNEL_CAP_HOT);
-        let (in_game_parameters_sender, in_game_parameters_receiver) = async_channel::bounded(CHANNEL_CAP_HOT);
-        let (game_ended_sender, game_ended_receiver) = async_channel::bounded(CHANNEL_CAP_COLD);
-        let (game_aborted_sender, game_aborted_receiver) = async_channel::bounded(CHANNEL_CAP_COLD);
-        let (in_game_event_sender, in_game_event_receiver) = async_channel::bounded(CHANNEL_CAP_HOT);
-        let (user_command_sender, user_command_receiver) = async_channel::bounded(CHANNEL_CAP_COMMAND);
+        let (reconnect_handshake_sender, reconnect_handshake_receiver) = mpsc::channel(CHANNEL_CAP_HOT);
+        let (lobby_found_sender, lobby_found_receiver) = mpsc::channel(CHANNEL_CAP_HOT);
+        let (in_game_parameters_sender, in_game_parameters_receiver) = mpsc::channel(CHANNEL_CAP_HOT);
+        let (game_ended_sender, game_ended_receiver) = mpsc::channel(CHANNEL_CAP_COLD);
+        let (game_aborted_sender, game_aborted_receiver) = mpsc::channel(CHANNEL_CAP_COLD);
+        let (in_game_event_sender, in_game_event_receiver) = mpsc::channel(CHANNEL_CAP_HOT);
+        let (user_command_sender, user_command_receiver) = mpsc::channel(CHANNEL_CAP_COMMAND);
         let senders = Arc::new(Senders {
-            reconnect_handshake: Arc::new(reconnect_handshake_sender),
-            lobby_found: Arc::new(lobby_found_sender),
-            in_game_parameters: Arc::new(in_game_parameters_sender),
-            game_ended: Arc::new(game_ended_sender),
-            game_aborted: Arc::new(game_aborted_sender),
-            in_game_event: Arc::new(in_game_event_sender),
-            user_command: Arc::new(user_command_sender)
+            reconnect_handshake: reconnect_handshake_sender,
+            lobby_found: lobby_found_sender,
+            in_game_parameters: in_game_parameters_sender,
+            game_ended: game_ended_sender,
+            game_aborted: game_aborted_sender,
+            in_game_event: in_game_event_sender,
+            user_command: user_command_sender,
         });
 
-        let receivers = Arc::new(Receivers {
-            reconnect_handshake: Arc::new(reconnect_handshake_receiver),
-            lobby_found: Arc::new(lobby_found_receiver),
-            in_game_parameters: Arc::new(in_game_parameters_receiver),
-            game_ended: Arc::new(game_ended_receiver),
-            game_aborted: Arc::new(game_aborted_receiver),
-            in_game_event: Arc::new(in_game_event_receiver),
-            user_command: Arc::new(user_command_receiver)
-        });
+        tokio::spawn(serve_for_producers(
+            reconnect_handshake_receiver,
+            lobby_found_receiver,
+            in_game_parameters_receiver,
+            game_ended_receiver,
+            game_aborted_receiver,
+            in_game_event_receiver,
+            user_command_receiver,
+            app_config,
+        ));
 
-        tokio::spawn(serve_for_producers(receivers, app_config));
-        
         serve_for_clients(tcp_listener, senders).await;
     }
     else {
@@ -480,34 +469,42 @@ async fn main() {
     }
 }
 
-async fn serve_for_producers(receivers: Arc<Receivers>, app_config: Arc<config::Config>) {
+async fn serve_for_producers(
+    reconnect_handshake: Receiver<ReconnectHandshake>,
+    lobby_found: Receiver<LobbyFound>,
+    in_game_parameters: Receiver<InGameParameters>,
+    game_ended: Receiver<GameEnded>,
+    game_aborted: Receiver<GameAborted>,
+    in_game_event: Receiver<InGameEvent>,
+    user_command: Receiver<UserCommand>,
+    app_config: Arc<config::Config>,
+) {
     let active_lobbies: Arc<Mutex<HashMap<String, Lobby>>> = Arc::new(Mutex::new(HashMap::new()));
     let bots_statistics: Arc<Mutex<BotsStatistics>> = Arc::new(Mutex::new(load_bots_statistics().await));
     let bots_play_time: Arc<Mutex<BotsPlayTime>> = Arc::new(Mutex::new(load_bots_play_time().await));
     tracing::info!("Bots statistics loaded: {:?}", bots_statistics.lock().await);
     tracing::info!("Bots play time loaded: {:?}", bots_play_time.lock().await);
 
-    tokio::spawn(serve_for_reconnect_handshake(Arc::clone(&receivers), Arc::clone(&active_lobbies)));
-    tokio::spawn(serve_for_lobby_found(Arc::clone(&receivers), Arc::clone(&active_lobbies)));
-    tokio::spawn(serve_for_in_game_parameters(Arc::clone(&receivers), Arc::clone(&active_lobbies), Arc::clone(&bots_statistics)));
+    tokio::spawn(serve_for_reconnect_handshake(reconnect_handshake, Arc::clone(&active_lobbies)));
+    tokio::spawn(serve_for_lobby_found(lobby_found, Arc::clone(&active_lobbies)));
+    tokio::spawn(serve_for_in_game_parameters(in_game_parameters, Arc::clone(&active_lobbies), Arc::clone(&bots_statistics)));
     tokio::spawn(serve_for_game_ended(
-        Arc::clone(&receivers),
+        game_ended,
         Arc::clone(&active_lobbies),
         Arc::clone(&bots_statistics),
         Arc::clone(&bots_play_time),
         Arc::clone(&app_config),
     ));
-    tokio::spawn(serve_for_game_aborted(Arc::clone(&receivers), Arc::clone(&active_lobbies), Arc::clone(&app_config)));
-    tokio::spawn(serve_for_in_game_event(Arc::clone(&receivers), Arc::clone(&active_lobbies)));
-    tokio::spawn(serve_for_user_termination_command(receivers, active_lobbies));
-
+    tokio::spawn(serve_for_game_aborted(game_aborted, Arc::clone(&active_lobbies), Arc::clone(&app_config)));
+    tokio::spawn(serve_for_in_game_event(in_game_event, Arc::clone(&active_lobbies)));
+    tokio::spawn(serve_for_user_termination_command(user_command, active_lobbies));
 }
 
 async fn serve_for_lobby_found(
-    receivers: Arc<Receivers>,
+    mut lobby_found_rx: Receiver<LobbyFound>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
 ) {
-    while let Ok(lobby_found) = receivers.lobby_found.recv().await {
+    while let Some(lobby_found) = lobby_found_rx.recv().await {
         tracing::info!(%lobby_found.bot_number, %lobby_found.lobby_id, "The servant of lobby-found received a message");
         let mut active_lobbies_guard = active_lobbies.lock().await;
         if let Some(lobby) = active_lobbies_guard.get_mut(&lobby_found.lobby_id) {
@@ -519,7 +516,7 @@ async fn serve_for_lobby_found(
         }
         else {
             tracing::info!(%lobby_found.lobby_id, %lobby_found.bot_number, "Registering a new lobby");
-            let (lobby_fullness_controller_sender, lobby_fullness_controller_receiver) = async_channel::bounded(CHANNEL_CAP_FULLNESS);
+            let (lobby_fullness_controller_sender, lobby_fullness_controller_receiver) = mpsc::channel(CHANNEL_CAP_FULLNESS);
             active_lobbies_guard.insert(lobby_found.lobby_id.clone(), Lobby::new(Some(lobby_fullness_controller_sender)));
             active_lobbies_guard
             .get_mut(&lobby_found.lobby_id).unwrap()
@@ -558,7 +555,7 @@ async fn send_lobby_timeout_verdict(
 
 async fn lobby_fullness_controller(
     lobby_id: String,
-    lobby_fullness_controller_receiver: Receiver<()>,
+    mut lobby_fullness_controller_receiver: Receiver<()>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
 ) {
     let lobby_full_wait = tokio::time::sleep(LOBBY_FULL_WAIT);
@@ -571,7 +568,7 @@ async fn lobby_fullness_controller(
                 break;
             },
             signal = lobby_fullness_controller_receiver.recv() => {
-                if signal.is_err() {
+                if signal.is_none() {
                     break;
                 }
 
@@ -595,10 +592,10 @@ async fn lobby_fullness_controller(
 }
 
 async fn serve_for_in_game_event(
-    receivers: Arc<Receivers>,
+    mut in_game_event_rx: Receiver<InGameEvent>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
 ) {
-    while let Ok(in_game_event) = receivers.in_game_event.recv().await {
+    while let Some(in_game_event) = in_game_event_rx.recv().await {
         tracing::info!(
             %in_game_event.lobby_id, %in_game_event.bot_number, %in_game_event.event, "The servant of in-game-event received a message"
         );
@@ -760,11 +757,11 @@ async fn save_bots_play_time(play_time: &BotsPlayTime) {
 }
 
 async fn serve_for_in_game_parameters(
-    receivers: Arc<Receivers>,
+    mut in_game_parameters_rx: Receiver<InGameParameters>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
     bots_statistics: Arc<Mutex<BotsStatistics>>,
 ) {
-    while let Ok(in_game_parameters) = receivers.in_game_parameters.recv().await {
+    while let Some(in_game_parameters) = in_game_parameters_rx.recv().await {
         tracing::info!(%in_game_parameters.lobby_id, %in_game_parameters.bot_number, %in_game_parameters.side, "The servant of in-game-parameters received a message");
 
         let mut active_lobbies_guard = active_lobbies.lock().await;
@@ -779,7 +776,7 @@ async fn serve_for_in_game_parameters(
             (roles_payload, replay_payload, notify, None)
         } else {
             tracing::info!(%in_game_parameters.lobby_id, %in_game_parameters.bot_number, %in_game_parameters.side, "In-game parameters fullness controller sender is not set, creating a new one");
-            let (sender, receiver) = async_channel::bounded(CHANNEL_CAP_FULLNESS);
+            let (sender, receiver) = mpsc::channel(CHANNEL_CAP_FULLNESS);
             lobby.in_game_parameters_fullness_controller_sender = Some(sender);
             lobby.bots.get_mut(&in_game_parameters.bot_number).unwrap().side = Some(in_game_parameters.side.clone());
             lobby.in_game_parameters_requesting_fullness = 1;
@@ -850,7 +847,7 @@ fn starter_replays_numbers_distributor(
 
 async fn in_game_parameters_fullness_controller(
     lobby_id: String,
-    in_game_parameters_fullness_controller_receiver: Receiver<()>,
+    mut in_game_parameters_fullness_controller_receiver: Receiver<()>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
     bots_statistics: Arc<Mutex<BotsStatistics>>,
 ) {
@@ -863,8 +860,8 @@ async fn in_game_parameters_fullness_controller(
             },
             signal = in_game_parameters_fullness_controller_receiver.recv() => {
                 tracing::info!(%lobby_id, "Distributing ongoing win team for lobby");
-                if signal.is_err() {
-                    tracing::error!("In-game parameters fullness controller receiver error: {:?}", &signal.err());
+                if signal.is_none() {
+                    tracing::error!("In-game parameters fullness controller receiver closed");
                     break;
                 }
                 if active_lobbies
@@ -942,10 +939,10 @@ fn compute_ongoing_win_team(lobby: &Lobby, stats: &BotsStatistics) -> String {
 }
 
 async fn serve_for_reconnect_handshake(
-    receivers: Arc<Receivers>,
+    mut reconnect_handshake_rx: Receiver<ReconnectHandshake>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
 ) {
-    while let Ok(reconnect_handshake) = receivers.reconnect_handshake.recv().await {
+    while let Some(reconnect_handshake) = reconnect_handshake_rx.recv().await {
         tracing::info!(%reconnect_handshake.lobby_id, %reconnect_handshake.bot_number, %reconnect_handshake.side, "The servant of reconnect handshake received a message");
         let mut active_lobbies_guard = active_lobbies.lock().await;
         if !active_lobbies_guard.contains_key(&reconnect_handshake.lobby_id) {
@@ -963,11 +960,11 @@ async fn serve_for_reconnect_handshake(
 }
 
 async fn serve_for_game_aborted(
-    receivers: Arc<Receivers>,
+    mut game_aborted_rx: Receiver<GameAborted>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
     app_config: Arc<config::Config>,
 ) {
-    while let Ok(game_aborted) = receivers.game_aborted.recv().await {
+    while let Some(game_aborted) = game_aborted_rx.recv().await {
         tracing::info!(%game_aborted.lobby_id, %game_aborted.bot_number, "The servant of game aborted received a message");
         let removed = {
             let mut active_lobbies_guard = active_lobbies.lock().await;
@@ -1009,13 +1006,13 @@ async fn serve_for_game_aborted(
 }
 
 async fn serve_for_game_ended(
-    receivers: Arc<Receivers>,
+    mut game_ended_rx: Receiver<GameEnded>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
     bots_statistics: Arc<Mutex<BotsStatistics>>,
     bots_play_time: Arc<Mutex<BotsPlayTime>>,
     app_config: Arc<config::Config>,
 ) {
-    while let Ok(game_ended) = receivers.game_ended.recv().await {
+    while let Some(game_ended) = game_ended_rx.recv().await {
         tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, %game_ended.dota_id, %game_ended.match_duration_secs, "The servant of game ended received a message");
         let removed = {
             let mut active_lobbies_guard = active_lobbies.lock().await;
@@ -1051,8 +1048,11 @@ async fn serve_for_game_ended(
     }
 }
 
-async fn serve_for_user_termination_command(receivers: Arc<Receivers>, active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>) {
-    while let Ok(user_command) = receivers.user_command.recv().await {
+async fn serve_for_user_termination_command(
+    mut user_command_rx: Receiver<UserCommand>,
+    active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
+) {
+    while let Some(user_command) = user_command_rx.recv().await {
         tracing::info!(%user_command.command, "The servant of user termination command received a message, affected bots: {:?}", &user_command.affected_bots);
         tracing::debug!("Active lobbies before user termination command: {:?}", &active_lobbies);
         let mut active_lobbies_guard = active_lobbies.lock().await;
