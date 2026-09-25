@@ -506,26 +506,37 @@ async fn serve_for_lobby_found(
 ) {
     while let Some(lobby_found) = lobby_found_rx.recv().await {
         tracing::info!(%lobby_found.bot_number, %lobby_found.lobby_id, "The servant of lobby-found received a message");
-        let mut active_lobbies_guard = active_lobbies.lock().await;
-        if let Some(lobby) = active_lobbies_guard.get_mut(&lobby_found.lobby_id) {
-            tracing::info!(%lobby_found.lobby_id, %lobby_found.bot_number, "Subscribing a new bot to the lobby");
-            lobby.bots.insert(lobby_found.bot_number, Bot::new(Arc::clone(&lobby_found.tcp_writer), None));
-            if let Err(e) = lobby.lobby_fullness_controller_sender.as_ref().unwrap().send(()).await {
-                 tracing::error!(?e, "Failed to notify lobby fullness controller");
+        let notify = {
+            let mut active_lobbies_guard = active_lobbies.lock().await;
+            if let Some(lobby) = active_lobbies_guard.get_mut(&lobby_found.lobby_id) {
+                tracing::info!(%lobby_found.lobby_id, %lobby_found.bot_number, "Subscribing a new bot to the lobby");
+                lobby.bots.insert(lobby_found.bot_number, Bot::new(Arc::clone(&lobby_found.tcp_writer), None));
+                lobby.lobby_fullness_controller_sender.clone()
+            } else {
+                tracing::info!(%lobby_found.lobby_id, %lobby_found.bot_number, "Registering a new lobby");
+                let (lobby_fullness_controller_sender, lobby_fullness_controller_receiver) =
+                    mpsc::channel(CHANNEL_CAP_FULLNESS);
+                active_lobbies_guard.insert(
+                    lobby_found.lobby_id.clone(),
+                    Lobby::new(Some(lobby_fullness_controller_sender)),
+                );
+                active_lobbies_guard
+                    .get_mut(&lobby_found.lobby_id)
+                    .unwrap()
+                    .bots
+                    .insert(lobby_found.bot_number, Bot::new(Arc::clone(&lobby_found.tcp_writer), None));
+                tokio::spawn(lobby_fullness_controller(
+                    lobby_found.lobby_id,
+                    lobby_fullness_controller_receiver,
+                    Arc::clone(&active_lobbies),
+                ));
+                None
             }
-        }
-        else {
-            tracing::info!(%lobby_found.lobby_id, %lobby_found.bot_number, "Registering a new lobby");
-            let (lobby_fullness_controller_sender, lobby_fullness_controller_receiver) = mpsc::channel(CHANNEL_CAP_FULLNESS);
-            active_lobbies_guard.insert(lobby_found.lobby_id.clone(), Lobby::new(Some(lobby_fullness_controller_sender)));
-            active_lobbies_guard
-            .get_mut(&lobby_found.lobby_id).unwrap()
-            .bots.insert(lobby_found.bot_number, Bot::new(Arc::clone(&lobby_found.tcp_writer), None));
-            tokio::spawn(lobby_fullness_controller(
-                lobby_found.lobby_id,
-                lobby_fullness_controller_receiver,
-                Arc::clone(&active_lobbies),
-            ));
+        };
+        if let Some(sender) = notify {
+            if let Err(e) = sender.send(()).await {
+                tracing::error!(?e, "Failed to notify lobby fullness controller");
+            }
         } 
     }
 
