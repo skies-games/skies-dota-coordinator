@@ -132,13 +132,45 @@ impl BotSourceEvent {
     }
 }
 
+#[derive(Debug)]
+enum ParseError {
+    MissingField(&'static str),
+    EmptyField(&'static str),
+    InvalidField(&'static str),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingField(name) => write!(f, "missing field `{name}`"),
+            Self::EmptyField(name) => write!(f, "empty field `{name}`"),
+            Self::InvalidField(name) => write!(f, "invalid field `{name}`"),
+        }
+    }
+}
+
+fn require_field<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    name: &'static str,
+) -> Result<&'a str, ParseError> {
+    let value = parts.next().ok_or(ParseError::MissingField(name))?;
+    if value.is_empty() {
+        return Err(ParseError::EmptyField(name));
+    }
+    Ok(value)
+}
+
 struct ConnectHandshake {
     bot_number: String,
 }
 
 impl ConnectHandshake {
-    fn new(message: &str) -> Self {
-        Self { bot_number: message[2..].to_string() }
+    /// Payload: `{bot_number}`
+    fn try_parse(payload: &str) -> Result<Self, ParseError> {
+        if payload.is_empty() {
+            return Err(ParseError::EmptyField("bot_number"));
+        }
+        Ok(Self { bot_number: payload.to_string() })
     }
 }
 
@@ -150,12 +182,16 @@ struct ReconnectHandshake {
 }
 
 impl ReconnectHandshake {
-    fn new(message: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Self {
-        let splitted_message = message.split(':').collect::<Vec<&str>>();
-        let bot_number: String = splitted_message[0][2..].to_string();
-        let lobby_id: String = splitted_message[1].to_string();
-        let side: String = splitted_message[2].to_string();
-        Self{lobby_id, bot_number, side, tcp_writer: Arc::clone(&tcp_writer)}
+    /// Payload: `{bot_number}:{lobby_id}:{side}`
+    fn try_parse(payload: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Result<Self, ParseError> {
+        let mut parts = payload.split(':');
+        let bot_number = require_field(&mut parts, "bot_number")?.to_string();
+        let lobby_id = require_field(&mut parts, "lobby_id")?.to_string();
+        let side = require_field(&mut parts, "side")?.to_string();
+        if side != "0" && side != "1" {
+            return Err(ParseError::InvalidField("side"));
+        }
+        Ok(Self { lobby_id, bot_number, side, tcp_writer })
     }
 }
 
@@ -166,11 +202,12 @@ struct LobbyFound {
 }
 
 impl LobbyFound {
-    fn new(message: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Self {
-        let (bot_number, lobby_id) = message.split_once(':').expect("Failed to split message into bot number and lobby id");
-        let bot_number: String = bot_number[2..].to_string();
-        let lobby_id: String = lobby_id.to_string();
-        Self{lobby_id, bot_number, tcp_writer: Arc::clone(&tcp_writer)}
+    /// Payload: `{bot_number}:{lobby_id}`
+    fn try_parse(payload: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Result<Self, ParseError> {
+        let mut parts = payload.split(':');
+        let bot_number = require_field(&mut parts, "bot_number")?.to_string();
+        let lobby_id = require_field(&mut parts, "lobby_id")?.to_string();
+        Ok(Self { lobby_id, bot_number, tcp_writer })
     }
 }
 
@@ -184,12 +221,16 @@ struct InGameParameters {
 }
 
 impl InGameParameters {
-    fn new(message: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Self {
-        let splitted_message = message.split(':').collect::<Vec<&str>>();
-        let bot_number: String = splitted_message[0][2..].to_string();
-        let lobby_id: String = splitted_message[1].to_string();
-        let side: String = splitted_message[2].to_string();
-        Self{lobby_id, bot_number, side, tcp_writer: Arc::clone(&tcp_writer)}
+    /// Payload: `{bot_number}:{lobby_id}:{side}`
+    fn try_parse(payload: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Result<Self, ParseError> {
+        let mut parts = payload.split(':');
+        let bot_number = require_field(&mut parts, "bot_number")?.to_string();
+        let lobby_id = require_field(&mut parts, "lobby_id")?.to_string();
+        let side = require_field(&mut parts, "side")?.to_string();
+        if side != "0" && side != "1" {
+            return Err(ParseError::InvalidField("side"));
+        }
+        Ok(Self { lobby_id, bot_number, side, tcp_writer })
     }
 }
 
@@ -201,13 +242,16 @@ struct GameEnded {
 }
 
 impl GameEnded {
-    fn new(message: &str) -> Self {
-        let splitted_message = message.split(':').collect::<Vec<&str>>();
-        let bot_number: String = splitted_message[0][2..].to_string();
-        let lobby_id: String = splitted_message[1].to_string();
-        let dota_id: String = splitted_message[2].to_string();
-        let match_duration_secs: u64 = splitted_message[3].parse().unwrap();
-        Self{lobby_id, bot_number, dota_id, match_duration_secs}
+    /// Payload: `{bot_number}:{lobby_id}:{dota_id}:{match_duration_secs}`
+    fn try_parse(payload: &str) -> Result<Self, ParseError> {
+        let mut parts = payload.split(':');
+        let bot_number = require_field(&mut parts, "bot_number")?.to_string();
+        let lobby_id = require_field(&mut parts, "lobby_id")?.to_string();
+        let dota_id = require_field(&mut parts, "dota_id")?.to_string();
+        let match_duration_secs = require_field(&mut parts, "match_duration_secs")?
+            .parse()
+            .map_err(|_| ParseError::InvalidField("match_duration_secs"))?;
+        Ok(Self { lobby_id, bot_number, dota_id, match_duration_secs })
     }
 }
 
@@ -217,11 +261,12 @@ struct GameAborted {
 }
 
 impl GameAborted {
-    fn new(message: &str) -> Self {
-        let splitted_message = message.split(':').collect::<Vec<&str>>();
-        let bot_number: String = splitted_message[0][2..].to_string();
-        let lobby_id: String = splitted_message[1].to_string();
-        Self { lobby_id, bot_number }
+    /// Payload: `{bot_number}:{lobby_id}`
+    fn try_parse(payload: &str) -> Result<Self, ParseError> {
+        let mut parts = payload.split(':');
+        let bot_number = require_field(&mut parts, "bot_number")?.to_string();
+        let lobby_id = require_field(&mut parts, "lobby_id")?.to_string();
+        Ok(Self { lobby_id, bot_number })
     }
 }
 
@@ -232,12 +277,13 @@ struct InGameEvent {
 }
 
 impl InGameEvent {
-    fn new(message: &str) -> Self {
-        let splitted_message = message.split(':').collect::<Vec<&str>>();
-        let bot_number: String = splitted_message[0][2..].to_string();
-        let lobby_id: String = splitted_message[1].to_string();
-        let event: String = splitted_message[2].to_string();
-        Self{lobby_id, bot_number, event}
+    /// Payload: `{bot_number}:{lobby_id}:{event}`
+    fn try_parse(payload: &str) -> Result<Self, ParseError> {
+        let mut parts = payload.split(':');
+        let bot_number = require_field(&mut parts, "bot_number")?.to_string();
+        let lobby_id = require_field(&mut parts, "lobby_id")?.to_string();
+        let event = require_field(&mut parts, "event")?.to_string();
+        Ok(Self { lobby_id, bot_number, event })
     }
 }
 
@@ -262,11 +308,25 @@ struct UserCommand {
 }
 
 impl UserCommand {
-    fn new(message: &str, bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>) -> Self {
-        let splitted_message = message.split(':').collect::<Vec<&str>>();
-        let command: String = splitted_message[0][1..2].to_string();
-        let affected_bots: Vec<String> = splitted_message[1].split(',').map(|s| s.to_string()).collect();
-        Self{command, affected_bots, bot_clients}
+    /// Payload after event byte: `:{bot1},{bot2},...`
+    fn try_parse(
+        payload: &str,
+        command: String,
+        bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
+    ) -> Result<Self, ParseError> {
+        let bots_str = payload.strip_prefix(':').unwrap_or(payload);
+        if bots_str.is_empty() {
+            return Err(ParseError::EmptyField("affected_bots"));
+        }
+        let affected_bots: Vec<String> = bots_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if affected_bots.is_empty() {
+            return Err(ParseError::EmptyField("affected_bots"));
+        }
+        Ok(Self { command, affected_bots, bot_clients })
     }
 }
 
@@ -1164,13 +1224,18 @@ async fn accept_client(
             tracing::error!(%socket_addr, "Non-UTF-8 message body");
             return;
         };
-        if message.len() <= 1 {
+        // Bot keep-alive: Client sends OUTBOUND_SOURCE + PROBE_PAYLOAD => "0."
+        if message == "0." {
+            continue;
+        }
+        if message.len() < 2 {
+            tracing::error!(%socket_addr, %message, "Message too short (need source + event)");
             continue;
         }
         tracing::info!(%message, "Received message");
         match Source::from_str(&message[..1]) {
-            Source::Bot => handle_bot_source(&message, Arc::clone(&tcp_writer), Arc::clone(&senders), Arc::clone(&bot_clients)).await,
-            Source::User => handle_user_source(&message, Arc::clone(&senders), Arc::clone(&bot_clients)).await,
+            Source::Bot => handle_bot_source(&message[1..], Arc::clone(&tcp_writer), Arc::clone(&senders), Arc::clone(&bot_clients)).await,
+            Source::User => handle_user_source(&message[1..], Arc::clone(&senders), Arc::clone(&bot_clients)).await,
             Source::Unknown => tracing::error!("Unknown source: {}", &message[..1]),
         }
     }
@@ -1178,34 +1243,41 @@ async fn accept_client(
 
 #[tracing::instrument(name = "handle_user_source", skip(senders, bot_clients), fields(msg_len = message.len()))]
 async fn handle_user_source(
-    message: &str, 
-    senders: Arc<Senders>, 
+    message: &str,
+    senders: Arc<Senders>,
     bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>
 ) {
     let mut timer = telemetry::OpTimer::start("handle_user_source");
+    // message = `{event}{payload}` (source already stripped)
+    let event = &message[..1];
+    let payload = &message[1..];
     tracing::info!(
         monotonic_counter.coordinator.messages = 1_u64,
         source = "user",
         "inbound message"
     );
-    match UserSourceEvent::from_str(&message[1..2]) {
-        UserSourceEvent::UserCommand => handle_user_command_to_terminate_bots(message, Arc::clone(&senders), Arc::clone(&bot_clients)).await,
+    match UserSourceEvent::from_str(event) {
+        UserSourceEvent::UserCommand => {
+            handle_user_command_to_terminate_bots(payload, event.to_string(), Arc::clone(&senders), Arc::clone(&bot_clients)).await
+        }
         UserSourceEvent::Unknown => {
             timer.error();
-            tracing::error!("Unknown command: {}", &message[1..2]);
+            tracing::error!(%event, "Unknown command");
         }
     }
 }
 
 #[tracing::instrument(name = "handle_bot_source", skip(tcp_writer, senders, bot_clients), fields(msg_len = message.len()))]
 async fn handle_bot_source(
-    message: &str, 
-    tcp_writer: Arc<Mutex<OwnedWriteHalf>>, 
-    senders: Arc<Senders>, 
+    message: &str,
+    tcp_writer: Arc<Mutex<OwnedWriteHalf>>,
+    senders: Arc<Senders>,
     bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>
 ) {
     let mut timer = telemetry::OpTimer::start("handle_bot_source");
-    let event = &message[1..2];
+    // message = `{event}{payload}` (source already stripped)
+    let event = &message[..1];
+    let payload = &message[1..];
     tracing::info!(
         monotonic_counter.coordinator.messages = 1_u64,
         source = "bot",
@@ -1213,41 +1285,54 @@ async fn handle_bot_source(
         "inbound message"
     );
     match BotSourceEvent::from_str(event) {
-        BotSourceEvent::ReconnectHandshake => handle_reconnect_handshake(message, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
-        BotSourceEvent::LobbyFound => handle_lobby_found(message, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
-        BotSourceEvent::InGameParameters => handle_in_game_parameters(message, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
-        BotSourceEvent::GameEnded => handle_game_ended(message, Arc::clone(&senders)).await,
-        BotSourceEvent::GameAborted => handle_game_aborted(message, Arc::clone(&senders)).await,
-        BotSourceEvent::InGameEvent => handle_in_game_event(message, Arc::clone(&senders)).await,
-        BotSourceEvent::ConnectHandshake => handle_connect_handshake(message, Arc::clone(&tcp_writer), Arc::clone(&bot_clients)).await,
+        BotSourceEvent::ReconnectHandshake => handle_reconnect_handshake(payload, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
+        BotSourceEvent::LobbyFound => handle_lobby_found(payload, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
+        BotSourceEvent::InGameParameters => handle_in_game_parameters(payload, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
+        BotSourceEvent::GameEnded => handle_game_ended(payload, Arc::clone(&senders)).await,
+        BotSourceEvent::GameAborted => handle_game_aborted(payload, Arc::clone(&senders)).await,
+        BotSourceEvent::InGameEvent => handle_in_game_event(payload, Arc::clone(&senders)).await,
+        BotSourceEvent::ConnectHandshake => handle_connect_handshake(payload, Arc::clone(&tcp_writer), Arc::clone(&bot_clients)).await,
         BotSourceEvent::Unknown => {
             timer.error();
-            tracing::error!("Unknown event: {}", event);
+            tracing::error!(%event, "Unknown event");
         }
     }
 }
 
 #[tracing::instrument(name = "handle_connect_handshake", skip(tcp_writer, bot_clients))]
 async fn handle_connect_handshake(
-    message: &str,
+    payload: &str,
     tcp_writer: Arc<Mutex<OwnedWriteHalf>>,
     bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
 ) {
-    // No fallible path — success on drop is correct.
-    let _timer = telemetry::OpTimer::start("handle_connect_handshake");
-    let connect_handshake = ConnectHandshake::new(message);
+    let mut timer = telemetry::OpTimer::start("handle_connect_handshake");
+    let connect_handshake = match ConnectHandshake::try_parse(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed connect handshake");
+            return;
+        }
+    };
     bot_clients.lock().await.insert(connect_handshake.bot_number.clone(), Arc::clone(&tcp_writer));
     tracing::info!(%connect_handshake.bot_number, "Bot registered via connect handshake");
 }
 
 #[tracing::instrument(name = "handle_lobby_found", skip(tcp_writer, senders))]
 async fn handle_lobby_found(
-    message: &str,
+    payload: &str,
     tcp_writer: Arc<Mutex<OwnedWriteHalf>>,
     senders: Arc<Senders>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_lobby_found");
-    let lobby_found = LobbyFound::new(message, Arc::clone(&tcp_writer));
+    let lobby_found = match LobbyFound::try_parse(payload, Arc::clone(&tcp_writer)) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed lobby found");
+            return;
+        }
+    };
     tracing::info!(%lobby_found.bot_number, %lobby_found.lobby_id, "Sending the found lobby to the receiver");
     if let Err(_) = senders.lobby_found.send(lobby_found).await {
         timer.error();
@@ -1258,11 +1343,18 @@ async fn handle_lobby_found(
 
 #[tracing::instrument(name = "handle_game_ended", skip(senders))]
 async fn handle_game_ended(
-    message: &str,
+    payload: &str,
     senders: Arc<Senders>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_game_ended");
-    let game_ended = GameEnded::new(message);
+    let game_ended = match GameEnded::try_parse(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed game ended");
+            return;
+        }
+    };
     tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, %game_ended.dota_id, %game_ended.match_duration_secs, "Sending the game ended to the receiver");
     if let Err(_) = senders.game_ended.send(game_ended).await {
         timer.error();
@@ -1272,11 +1364,18 @@ async fn handle_game_ended(
 
 #[tracing::instrument(name = "handle_in_game_event", skip(senders))]
 async fn handle_in_game_event(
-    message: &str,
+    payload: &str,
     senders: Arc<Senders>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_in_game_event");
-    let in_game_event = InGameEvent::new(message);
+    let in_game_event = match InGameEvent::try_parse(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed in-game event");
+            return;
+        }
+    };
     tracing::info!(%in_game_event.lobby_id, %in_game_event.bot_number, %in_game_event.event, "Sending the in-game event that happened to the receiver");
     if let Err(_) = senders.in_game_event.send(in_game_event).await {
         timer.error();
@@ -1287,12 +1386,19 @@ async fn handle_in_game_event(
 
 #[tracing::instrument(name = "handle_in_game_parameters", skip(tcp_writer, senders))]
 async fn handle_in_game_parameters(
-    message: &str,
+    payload: &str,
     tcp_writer: Arc<Mutex<OwnedWriteHalf>>,
     senders: Arc<Senders>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_in_game_parameters");
-    let in_game_parameters = InGameParameters::new(message, Arc::clone(&tcp_writer));
+    let in_game_parameters = match InGameParameters::try_parse(payload, Arc::clone(&tcp_writer)) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed in-game parameters");
+            return;
+        }
+    };
     tracing::info!(%in_game_parameters.lobby_id, %in_game_parameters.bot_number, %in_game_parameters.side, "Sending the in-game parameters to the receiver");
     if let Err(_) = senders.in_game_parameters.send(in_game_parameters).await {
         timer.error();
@@ -1303,12 +1409,19 @@ async fn handle_in_game_parameters(
 
 #[tracing::instrument(name = "handle_reconnect_handshake", skip(tcp_writer, senders))]
 async fn handle_reconnect_handshake(
-    message: &str,
+    payload: &str,
     tcp_writer: Arc<Mutex<OwnedWriteHalf>>,
     senders: Arc<Senders>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_reconnect_handshake");
-    let reconnect_handshake = ReconnectHandshake::new(message, Arc::clone(&tcp_writer));
+    let reconnect_handshake = match ReconnectHandshake::try_parse(payload, Arc::clone(&tcp_writer)) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed reconnect handshake");
+            return;
+        }
+    };
     tracing::info!(%reconnect_handshake.bot_number, %reconnect_handshake.lobby_id, "Sending the reconnect handshake to the receiver");
     if let Err(_) = senders.reconnect_handshake.send(reconnect_handshake).await {
         timer.error();
@@ -1319,11 +1432,18 @@ async fn handle_reconnect_handshake(
 
 #[tracing::instrument(name = "handle_game_aborted", skip(senders))]
 async fn handle_game_aborted(
-    message: &str,
+    payload: &str,
     senders: Arc<Senders>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_game_aborted");
-    let game_aborted = GameAborted::new(message);
+    let game_aborted = match GameAborted::try_parse(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed game aborted");
+            return;
+        }
+    };
     tracing::info!(%game_aborted.lobby_id, %game_aborted.bot_number, "Sending the game aborted to the receiver");
     if let Err(_) = senders.game_aborted.send(game_aborted).await {
         timer.error();
@@ -1334,12 +1454,20 @@ async fn handle_game_aborted(
 
 #[tracing::instrument(name = "handle_user_command_to_terminate_bots", skip(senders, bot_clients))]
 async fn handle_user_command_to_terminate_bots(
-    message: &str, 
-    senders: Arc<Senders>, 
+    payload: &str,
+    command: String,
+    senders: Arc<Senders>,
     bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>
 ) {
     let mut timer = telemetry::OpTimer::start("handle_user_command_to_terminate_bots");
-    let user_command = UserCommand::new(message, Arc::clone(&bot_clients));
+    let user_command = match UserCommand::try_parse(payload, command, Arc::clone(&bot_clients)) {
+        Ok(v) => v,
+        Err(e) => {
+            timer.error();
+            tracing::error!(%e, %payload, "Malformed user command");
+            return;
+        }
+    };
     tracing::info!(%user_command.command, "Sending the user command to the receiver, affected bots: {:?}", &user_command.affected_bots);
     if let Err(_) = senders.user_command.send(user_command).await {
         timer.error();
