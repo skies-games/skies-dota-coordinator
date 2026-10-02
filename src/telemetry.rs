@@ -12,8 +12,10 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::runtime;
+use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -152,9 +154,12 @@ pub fn init(config: &Config) -> OtelGuard {
 			.with_timeout(timeout)
 			.build()
 			.expect("failed to build Tempo span exporter");
+		// Reqwest needs a Tokio reactor — use async-runtime batch processor (not the
+		// default thread-based BatchSpanProcessor which panics with "no reactor running").
+		let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
 		let provider = SdkTracerProvider::builder()
 			.with_resource(resource.clone())
-			.with_batch_exporter(exporter)
+			.with_span_processor(processor)
 			.build();
 		global::set_tracer_provider(provider.clone());
 		Some(provider)
@@ -171,9 +176,10 @@ pub fn init(config: &Config) -> OtelGuard {
 			.with_timeout(timeout)
 			.build()
 			.expect("failed to build VictoriaMetrics metric exporter");
+		let reader = PeriodicReader::builder(exporter, runtime::Tokio).build();
 		let provider = SdkMeterProvider::builder()
 			.with_resource(resource.clone())
-			.with_periodic_exporter(exporter)
+			.with_reader(reader)
 			.build();
 		global::set_meter_provider(provider.clone());
 		Some(provider)
