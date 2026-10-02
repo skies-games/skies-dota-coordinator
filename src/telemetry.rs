@@ -1,6 +1,7 @@
-//! OTLP (gRPC) → cluster otel-collector: traces, metrics, logs.
-//! Same gateway as tg-bot (`OTEL_EXPORTER_OTLP_ENDPOINT`, port 4317).
+//! OTLP/HTTP direct to backends (no otel-collector):
+//! traces → Tempo, metrics → VictoriaMetrics, logs → OpenObserve.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -8,9 +9,11 @@ use opentelemetry::metrics::{Gauge, Histogram};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -126,18 +129,29 @@ fn resource(config: &Config) -> Resource {
 		.build()
 }
 
+fn basic_auth_headers(credentials: &str) -> HashMap<String, String> {
+	HashMap::from([("Authorization".into(), format!("Basic {credentials}"))])
+}
+
+fn http_client() -> reqwest::Client {
+	reqwest::Client::builder()
+		.build()
+		.expect("failed to build reqwest client")
+}
+
 pub fn init(config: &Config) -> OtelGuard {
 	let resource = resource(config);
-	let endpoint = config.otel_endpoint.clone();
 	let timeout = Duration::from_secs(5);
 
 	let tracer_provider = if config.otel_traces_enabled {
 		let exporter = SpanExporter::builder()
-			.with_tonic()
-			.with_endpoint(endpoint.clone())
+			.with_http()
+			.with_endpoint(config.tempo_endpoint.clone())
+			.with_headers(basic_auth_headers(&config.tempo_credentials))
+			.with_http_client(http_client())
 			.with_timeout(timeout)
 			.build()
-			.expect("failed to build OTLP span exporter");
+			.expect("failed to build Tempo span exporter");
 		let provider = SdkTracerProvider::builder()
 			.with_resource(resource.clone())
 			.with_batch_exporter(exporter)
@@ -150,11 +164,13 @@ pub fn init(config: &Config) -> OtelGuard {
 
 	let meter_provider = if config.otel_metrics_enabled {
 		let exporter = MetricExporter::builder()
-			.with_tonic()
-			.with_endpoint(endpoint.clone())
+			.with_http()
+			.with_endpoint(config.victoria_metrics_endpoint.clone())
+			.with_headers(basic_auth_headers(&config.victoria_metrics_credentials))
+			.with_http_client(http_client())
 			.with_timeout(timeout)
 			.build()
-			.expect("failed to build OTLP metric exporter");
+			.expect("failed to build VictoriaMetrics metric exporter");
 		let provider = SdkMeterProvider::builder()
 			.with_resource(resource.clone())
 			.with_periodic_exporter(exporter)
@@ -166,16 +182,23 @@ pub fn init(config: &Config) -> OtelGuard {
 	};
 
 	let logger_provider = if config.otel_logs_enabled {
+		let mut headers = basic_auth_headers(&config.openobserve_credentials);
+		headers.insert("organization".into(), config.openobserve_organization.clone());
+		headers.insert("stream-name".into(), config.openobserve_stream_name.clone());
+
 		let exporter = LogExporter::builder()
-			.with_tonic()
-			.with_endpoint(endpoint)
+			.with_http()
+			.with_endpoint(config.openobserve_endpoint.clone())
+			.with_headers(headers)
+			.with_http_client(http_client())
 			.with_timeout(timeout)
 			.build()
-			.expect("failed to build OTLP log exporter");
+			.expect("failed to build OpenObserve log exporter");
+		let processor = BatchLogProcessor::builder(exporter, runtime::Tokio).build();
 		Some(
 			SdkLoggerProvider::builder()
 				.with_resource(resource)
-				.with_batch_exporter(exporter)
+				.with_log_processor(processor)
 				.build(),
 		)
 	} else {
@@ -194,9 +217,9 @@ pub fn init(config: &Config) -> OtelGuard {
 		.with_ansi(false)
 		.with_writer(file_writer);
 
-	let trace_layer = tracer_provider.as_ref().map(|p| {
-		OpenTelemetryLayer::new(p.tracer(config.app_name.clone()))
-	});
+	let trace_layer = tracer_provider
+		.as_ref()
+		.map(|p| OpenTelemetryLayer::new(p.tracer(config.app_name.clone())));
 	let metrics_layer = meter_provider
 		.as_ref()
 		.map(|p| MetricsLayer::new(p.clone()));
