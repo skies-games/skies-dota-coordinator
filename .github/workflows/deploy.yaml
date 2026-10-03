@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [otel-direct-backends]
 
 env:
   SSH_USER: root
@@ -19,11 +19,9 @@ jobs:
           username: ${{ env.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
           script: |
-            set -euo pipefail
-            source "$HOME/.cargo/env"
             cd "${{ env.DEPLOY_PATH }}"
-            git fetch origin main
-            git reset --hard origin/main
+            git fetch origin otel-direct-backends
+            git reset --hard origin/otel-direct-backends
             cargo build --release
-            sudo systemctl restart coordinator.service
+            systemctl restart coordinator.service
             systemctl is-active --quiet coordinator.service
