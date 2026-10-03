@@ -543,7 +543,11 @@ async fn serve_for_producers(
     let bots_statistics: Arc<Mutex<BotsStatistics>> = Arc::new(Mutex::new(load_bots_statistics().await));
     let bots_play_time: Arc<Mutex<BotsPlayTime>> = Arc::new(Mutex::new(load_bots_play_time().await));
     tracing::info!("Bots statistics loaded: {:?}", bots_statistics.lock().await);
-    tracing::info!("Bots play time loaded: {:?}", bots_play_time.lock().await);
+    {
+        let play_time_guard = bots_play_time.lock().await;
+        tracing::info!("Bots play time loaded: {:?}", &*play_time_guard);
+        publish_bots_play_time_metrics(&*play_time_guard);
+    }
 
     tokio::spawn(serve_for_reconnect_handshake(reconnect_handshake, Arc::clone(&active_lobbies)));
     tokio::spawn(serve_for_lobby_found(lobby_found, Arc::clone(&active_lobbies)));
@@ -798,6 +802,11 @@ async fn update_bots_play_time_after_game(
 ) {
     let match_minutes = game_ended.match_duration_secs / 60;
     tracing::info!(%game_ended.bot_number, "Adding {} minutes of play time to bot", &match_minutes);
+    telemetry::record_match_duration(
+        &game_ended.bot_number,
+        &game_ended.dota_id,
+        game_ended.match_duration_secs,
+    );
     let bot_accounts = play_time.bots.entry(game_ended.bot_number.clone()).or_default();
     let stale_dota_ids: Vec<String> = bot_accounts
         .keys()
@@ -814,6 +823,14 @@ async fn update_bots_play_time_after_game(
     telemetry::record_bot_play_time(&game_ended.bot_number, &game_ended.dota_id, *total_minutes);
 
     tracing::debug!(%game_ended.lobby_id, "Bots play time after update: {:?}", &play_time);
+}
+
+fn publish_bots_play_time_metrics(play_time: &BotsPlayTime) {
+    for (bot_number, accounts) in &play_time.bots {
+        for (dota_id, total_minutes) in accounts {
+            telemetry::record_bot_play_time(bot_number, dota_id, *total_minutes);
+        }
+    }
 }
 
 async fn save_bots_play_time(play_time: &BotsPlayTime) {

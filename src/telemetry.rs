@@ -108,6 +108,16 @@ fn bot_play_time_minutes() -> &'static Gauge<f64> {
 	})
 }
 
+fn match_duration_minutes() -> &'static Histogram<f64> {
+	static HIST: OnceLock<Histogram<f64>> = OnceLock::new();
+	HIST.get_or_init(|| {
+		global::meter("coordinator")
+			.f64_histogram("coordinator.match.duration")
+			.with_unit("min")
+			.build()
+	})
+}
+
 /// Current cumulative play time for a bot account → OTLP metrics backend
 pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64) {
 	bot_play_time_minutes().record(
@@ -119,13 +129,25 @@ pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64)
 	);
 }
 
+/// Per-match duration (minutes, float) from game-ended payloads.
+pub fn record_match_duration(bot_number: &str, dota_id: &str, duration_secs: u64) {
+	match_duration_minutes().record(
+		duration_secs as f64 / 60.0,
+		&[
+			KeyValue::new("bot_number", bot_number.to_string()),
+			KeyValue::new("dota_id", dota_id.to_string()),
+		],
+	);
+}
+
 fn resource(config: &Config) -> Resource {
 	Resource::builder()
 		.with_service_name(config.app_name.clone())
 		.with_attributes([
-			KeyValue::new("service.name", config.app_name.clone()),
-			KeyValue::new("service.version", config.app_version.clone()),
+			KeyValue::new("app", config.app_name.clone()),
+			KeyValue::new("app_version", config.app_version.clone()),
 			KeyValue::new("deployment.environment", config.deployment_env.clone()),
+			KeyValue::new("env", config.deployment_env.clone()),
 			KeyValue::new("debug", config.debug),
 		])
 		.build()
