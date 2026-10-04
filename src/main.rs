@@ -28,8 +28,8 @@ source codes converter:
 bot source event codes converter:
     "0" => "reconnect_handshake",
     "1" => "lobby_found",
-    "2" => "in_game_parameters",
-    "3" => "game_ended",
+    "2" => "in_game_parameters"  // payload: {bot}:{lobby}:{side}:{dota_id}
+    "3" => "game_ended",          // payload: {bot}:{lobby}:{dota_id}:{match_duration_secs}
     "4" => "game_aborted",
     "5" => "in_game_event",
     "6" => "connect_handshake",
@@ -66,7 +66,10 @@ const CHANNEL_CAP_COLD: usize = 256;
 const CHANNEL_CAP_COMMAND: usize = 32;
 const CHANNEL_CAP_FULLNESS: usize = 16;
 
-const MATCH_RESULT_BUFFER_LEN: usize = 10;
+/// How many recent W/L results we keep per bot for streak decisions.
+const MATCH_RESULT_BUFFER_LEN: usize = 4;
+/// Lose-streak urgency is weighted heavier than win-streak urgency.
+const LOSE_STREAK_URGENCY_WEIGHT: i32 = 3;
 
 const BOTS_STATISTICS_PATH: &str = "bots_statistics.json";
 const BOTS_STATISTICS_TMP_PATH: &str = "bots_statistics.json.tmp";
@@ -89,6 +92,9 @@ struct BotsStatistics {
     /// Cumulative career W/L for metrics (survives the streak window trim).
     #[serde(default)]
     career: HashMap<String, CareerRecord>,
+    /// Last known Steam/Dota account per bot_number. Stats are wiped on switch.
+    #[serde(default)]
+    active_dota_ids: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -231,11 +237,12 @@ struct InGameParameters {
     lobby_id: String,
     bot_number: String,
     side: String,
+    dota_id: String,
     tcp_writer: Arc<Mutex<OwnedWriteHalf>>
 }
 
 impl InGameParameters {
-    /// Payload: `{bot_number}:{lobby_id}:{side}`
+    /// Payload: `{bot_number}:{lobby_id}:{side}:{dota_id}`
     fn try_parse(payload: &str, tcp_writer: Arc<Mutex<OwnedWriteHalf>>) -> Result<Self, ParseError> {
         let mut parts = payload.split(':');
         let bot_number = require_field(&mut parts, "bot_number")?.to_string();
@@ -244,7 +251,11 @@ impl InGameParameters {
         if side != "0" && side != "1" {
             return Err(ParseError::InvalidField("side"));
         }
-        Ok(Self { lobby_id, bot_number, side, tcp_writer })
+        let dota_id = require_field(&mut parts, "dota_id")?.to_string();
+        if dota_id.is_empty() {
+            return Err(ParseError::InvalidField("dota_id"));
+        }
+        Ok(Self { lobby_id, bot_number, side, dota_id, tcp_writer })
     }
 }
 
@@ -393,11 +404,94 @@ struct Senders {
     user_command: Sender<UserCommand>,
 }
 
-fn bot_streak_score(results: &[MatchResult]) -> i8 {
-    results.iter().map(|result| match result {
-        MatchResult::Win => 1,
-        MatchResult::Lose => -1,
-    }).sum()
+/// Count how many loses are at the end of history.
+/// Example: [W, L, L, L] -> 3
+fn trailing_lose_streak(results: &[MatchResult]) -> usize {
+    results.iter().rev().take_while(|result| **result == MatchResult::Lose).count()
+}
+
+/// Count how many wins are at the end of history.
+/// Example: [L, W, W] -> 2
+fn trailing_win_streak(results: &[MatchResult]) -> usize {
+    results.iter().rev().take_while(|result| **result == MatchResult::Win).count()
+}
+
+/// Aggregated streak numbers for one side (5 bots).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SideStreakStats {
+    max_lose: usize,
+    sum_lose: usize,
+    max_win: usize,
+    sum_win: usize,
+    urgency: i32,
+}
+
+/// Turn many bot histories on one side into one SideStreakStats.
+fn side_streak_stats<'a, I>(results_iter: I) -> SideStreakStats
+where
+    I: IntoIterator<Item = &'a [MatchResult]>,
+{
+    let mut stats = SideStreakStats::default();
+    for results in results_iter {
+        let lose = trailing_lose_streak(results);
+        let win = trailing_win_streak(results);
+        stats.max_lose = stats.max_lose.max(lose);
+        stats.sum_lose += lose;
+        stats.max_win = stats.max_win.max(win);
+        stats.sum_win += win;
+        // lose pain counts more than win heat
+        stats.urgency += (lose as i32).pow(2) * LOSE_STREAK_URGENCY_WEIGHT - (win as i32).pow(2);
+    }
+    stats
+}
+
+/// Decide which side should get the forced win.
+///
+/// Priority (high → low):
+/// 1. larger max trailing lose streak
+/// 2. larger sum of trailing lose streaks
+/// 3. smaller max trailing win streak
+/// 4. smaller sum of trailing win streaks
+/// 5. larger urgency
+/// 6. fair coin flip
+fn pick_win_side(radiant: SideStreakStats, dire: SideStreakStats) -> String {
+    use std::cmp::Ordering;
+
+    // `greater_picks_side0`:
+    // - true  => bigger metric wins the game (used for lose pain)
+    // - false => bigger metric loses the game (used for win heat)
+    let decide = |ordering: Ordering, greater_picks_side0: bool| -> Option<&'static str> {
+        match ordering {
+            Ordering::Equal => None,
+            Ordering::Greater => Some(if greater_picks_side0 { "0" } else { "1" }),
+            Ordering::Less => Some(if greater_picks_side0 { "1" } else { "0" }),
+        }
+    };
+
+    if let Some(side) = decide(radiant.max_lose.cmp(&dire.max_lose), true) {
+        tracing::info!(%side, radiant_max_lose = radiant.max_lose, dire_max_lose = dire.max_lose, "Win team by max trailing lose streak");
+        return side.to_string();
+    }
+    if let Some(side) = decide(radiant.sum_lose.cmp(&dire.sum_lose), true) {
+        tracing::info!(%side, radiant_sum_lose = radiant.sum_lose, dire_sum_lose = dire.sum_lose, "Win team by sum trailing lose streaks");
+        return side.to_string();
+    }
+    if let Some(side) = decide(radiant.max_win.cmp(&dire.max_win), false) {
+        tracing::info!(%side, radiant_max_win = radiant.max_win, dire_max_win = dire.max_win, "Win team by breaking max trailing win streak");
+        return side.to_string();
+    }
+    if let Some(side) = decide(radiant.sum_win.cmp(&dire.sum_win), false) {
+        tracing::info!(%side, radiant_sum_win = radiant.sum_win, dire_sum_win = dire.sum_win, "Win team by breaking sum trailing win streaks");
+        return side.to_string();
+    }
+    if let Some(side) = decide(radiant.urgency.cmp(&dire.urgency), true) {
+        tracing::info!(%side, radiant_urgency = radiant.urgency, dire_urgency = dire.urgency, "Win team by streak urgency");
+        return side.to_string();
+    }
+
+    let side = if rand::rng().random_range(0..2) == 0 { "0" } else { "1" };
+    tracing::info!(%side, "Win team by fair coin flip");
+    side.to_string()
 }
 
 async fn write_prefixed(writer: &mut OwnedWriteHalf, payload: &[u8]) -> std::io::Result<()> {
@@ -755,10 +849,40 @@ fn publish_bots_career_metrics(stats: &BotsStatistics) {
 }
 
 fn push_match_result(results: &mut Vec<MatchResult>, result: MatchResult) {
-    if results.len() == MATCH_RESULT_BUFFER_LEN {
+    // `while` so old JSON with > BUFFER_LEN entries shrinks safely after lowering the const.
+    while results.len() >= MATCH_RESULT_BUFFER_LEN {
         results.remove(0);
     }
     results.push(result);
+}
+
+/// Bind streak/career stats to the current Dota account.
+/// Returns true when the binding map / stats were mutated (caller should persist).
+/// If the bot switched accounts, wipe previous W/L so the new account starts clean
+/// before win-team is computed.
+fn bind_bot_statistics_account(stats: &mut BotsStatistics, bot_number: &str, dota_id: &str) -> bool {
+    match stats.active_dota_ids.get(bot_number) {
+        Some(active) if active == dota_id => false,
+        Some(active) => {
+            let previous = active.clone();
+            tracing::info!(
+                %bot_number,
+                %previous,
+                %dota_id,
+                "Bot switched account: resetting match streak and career stats"
+            );
+            stats.bots.insert(bot_number.to_string(), Vec::new());
+            stats.career.insert(bot_number.to_string(), CareerRecord::default());
+            stats.active_dota_ids.insert(bot_number.to_string(), dota_id.to_string());
+            telemetry::record_bot_career(bot_number, 0, 0);
+            true
+        }
+        None => {
+            tracing::info!(%bot_number, %dota_id, "Binding bot statistics to dota account");
+            stats.active_dota_ids.insert(bot_number.to_string(), dota_id.to_string());
+            true
+        }
+    }
 }
 
 async fn save_bots_statistics(stats: &BotsStatistics) {
@@ -826,17 +950,14 @@ async fn send_telegram_message(app_config: &config::Config, text: &str) {
     }
 }
 
+/// Credit play time for one reporting bot. Every bot already sends `game_ended`;
+/// first report also removes the lobby / updates stats; later reports still land here.
 async fn update_bots_play_time_after_game(
     play_time: &mut BotsPlayTime,
     game_ended: &GameEnded,
 ) {
     let match_minutes = game_ended.match_duration_secs / 60;
     tracing::info!(%game_ended.bot_number, "Adding {} minutes of play time to bot", &match_minutes);
-    telemetry::record_match_duration(
-        &game_ended.bot_number,
-        &game_ended.dota_id,
-        game_ended.match_duration_secs,
-    );
     let bot_accounts = play_time.bots.entry(game_ended.bot_number.clone()).or_default();
     let stale_dota_ids: Vec<String> = bot_accounts
         .keys()
@@ -873,7 +994,24 @@ async fn serve_for_in_game_parameters(
     bots_statistics: Arc<Mutex<BotsStatistics>>,
 ) {
     while let Some(in_game_parameters) = in_game_parameters_rx.recv().await {
-        tracing::info!(%in_game_parameters.lobby_id, %in_game_parameters.bot_number, %in_game_parameters.side, "The servant of in-game-parameters received a message");
+        tracing::info!(
+            %in_game_parameters.lobby_id,
+            %in_game_parameters.bot_number,
+            %in_game_parameters.side,
+            %in_game_parameters.dota_id,
+            "The servant of in-game-parameters received a message"
+        );
+
+        {
+            let mut stats_guard = bots_statistics.lock().await;
+            if bind_bot_statistics_account(
+                &mut *stats_guard,
+                &in_game_parameters.bot_number,
+                &in_game_parameters.dota_id,
+            ) {
+                save_bots_statistics(&*stats_guard).await;
+            }
+        }
 
         let mut active_lobbies_guard = active_lobbies.lock().await;
         let lobby = active_lobbies_guard.get_mut(&in_game_parameters.lobby_id).unwrap();
@@ -1027,26 +1165,22 @@ async fn distribute_ongoing_win_team(
 }
 
 fn compute_ongoing_win_team(lobby: &Lobby, stats: &BotsStatistics) -> String {
-    let mut radiant_score = 0;
-    let mut dire_score = 0;
+    let mut radiant_histories = Vec::new();
+    let mut dire_histories = Vec::new();
     for (bot_number, bot) in &lobby.bots {
-        let score = bot_streak_score(
-            stats.bots.get(bot_number) 
-            .map_or(&[], |v| v)
-        );
-        if bot.side.as_ref().unwrap() == "0" {
-            radiant_score += score;
-        }
-        else {
-            dire_score += score;
+        let history = stats.bots.get(bot_number).map_or(&[][..], |v| v.as_slice());
+        match bot.side.as_deref() {
+            Some("0") => radiant_histories.push(history),
+            Some("1") => dire_histories.push(history),
+            other => {
+                tracing::error!(%bot_number, ?other, "Bot has invalid side while computing win team");
+            }
         }
     }
-    if radiant_score <= dire_score {
-        "0".to_string()
-    }
-    else {
-        "1".to_string()
-    }
+    let radiant = side_streak_stats(radiant_histories);
+    let dire = side_streak_stats(dire_histories);
+    tracing::info!(?radiant, ?dire, "Side streak stats for ongoing win team");
+    pick_win_side(radiant, dire)
 }
 
 async fn serve_for_reconnect_handshake(
@@ -1149,13 +1283,13 @@ async fn serve_for_game_ended(
                 let mut stats_guard = bots_statistics.lock().await;
                 update_bots_statistics_after_game(&lobby, &mut *stats_guard);
                 save_bots_statistics(&*stats_guard).await;
-                drop(stats_guard);
-                let mut play_time_guard = bots_play_time.lock().await;
-                update_bots_play_time_after_game(&mut *play_time_guard, &game_ended).await;
-                save_bots_play_time(&*play_time_guard).await;
             } else {
-                tracing::info!(%game_ended.lobby_id, "Lobby was already reported as game ended");
+                tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, "Lobby already closed; still crediting play time for this bot");
             }
+            // Every bot sends game_ended with its own dota_id + clock_time — credit each.
+            let mut play_time_guard = bots_play_time.lock().await;
+            update_bots_play_time_after_game(&mut *play_time_guard, &game_ended).await;
+            save_bots_play_time(&*play_time_guard).await;
         }
         .instrument(tracing::info_span!("serve_game_ended", %lobby_id, %bot_number))
         .await;
@@ -1446,7 +1580,13 @@ async fn handle_in_game_parameters(
             return;
         }
     };
-    tracing::info!(%in_game_parameters.lobby_id, %in_game_parameters.bot_number, %in_game_parameters.side, "Sending the in-game parameters to the receiver");
+    tracing::info!(
+        %in_game_parameters.lobby_id,
+        %in_game_parameters.bot_number,
+        %in_game_parameters.side,
+        %in_game_parameters.dota_id,
+        "Sending the in-game parameters to the receiver"
+    );
     if let Err(_) = senders.in_game_parameters.send(in_game_parameters).await {
         timer.error();
         tracing::error!("Failed to send the in-game parameters to the receiver");
@@ -1520,5 +1660,114 @@ async fn handle_user_command_to_terminate_bots(
         timer.error();
         tracing::error!("Failed to send the user command to the receiver");
         return;
+    }
+}
+
+#[cfg(test)]
+mod win_team_tests {
+    use super::*;
+
+    fn loses(n: usize) -> Vec<MatchResult> {
+        vec![MatchResult::Lose; n]
+    }
+
+    fn wins(n: usize) -> Vec<MatchResult> {
+        vec![MatchResult::Win; n]
+    }
+
+    #[test]
+    fn trailing_streaks_count_only_suffix() {
+        let history = vec![
+            MatchResult::Win,
+            MatchResult::Lose,
+            MatchResult::Lose,
+            MatchResult::Lose,
+        ];
+        assert_eq!(trailing_lose_streak(&history), 3);
+        assert_eq!(trailing_win_streak(&history), 0);
+
+        let history = vec![
+            MatchResult::Lose,
+            MatchResult::Win,
+            MatchResult::Win,
+        ];
+        assert_eq!(trailing_win_streak(&history), 2);
+        assert_eq!(trailing_lose_streak(&history), 0);
+    }
+
+    #[test]
+    fn max_lose_streak_outranks_hot_teammates() {
+        // Cold bot with 3 loses on Radiant, hot teammates on win streaks.
+        let radiant = side_streak_stats([
+            loses(3).as_slice(),
+            wins(3).as_slice(),
+            wins(3).as_slice(),
+            wins(2).as_slice(),
+            wins(2).as_slice(),
+        ]);
+        let dire = side_streak_stats([
+            loses(1).as_slice(),
+            loses(1).as_slice(),
+            &[][..],
+            &[][..],
+            &[][..],
+        ]);
+        assert_eq!(pick_win_side(radiant, dire), "0");
+    }
+
+    #[test]
+    fn lose_rescue_outranks_win_streak_breaking() {
+        let radiant = side_streak_stats([loses(3).as_slice(), wins(3).as_slice()]);
+        let dire = side_streak_stats([wins(2).as_slice(), wins(2).as_slice()]);
+        // Radiant has both a 3-lose and a 3-win bot; lose rescue must win.
+        assert_eq!(pick_win_side(radiant, dire), "0");
+    }
+
+    #[test]
+    fn push_match_result_trims_oversized_history() {
+        let mut results = vec![
+            MatchResult::Win,
+            MatchResult::Win,
+            MatchResult::Lose,
+            MatchResult::Lose,
+            MatchResult::Lose,
+            MatchResult::Lose,
+        ];
+        push_match_result(&mut results, MatchResult::Win);
+        assert_eq!(results.len(), MATCH_RESULT_BUFFER_LEN);
+        assert_eq!(
+            results,
+            vec![
+                MatchResult::Lose,
+                MatchResult::Lose,
+                MatchResult::Lose,
+                MatchResult::Win
+            ]
+        );
+    }
+
+    #[test]
+    fn when_loses_tied_break_the_hotter_side() {
+        let radiant = side_streak_stats([wins(5).as_slice(), &[][..]]);
+        let dire = side_streak_stats([wins(1).as_slice(), &[][..]]);
+        assert_eq!(pick_win_side(radiant, dire), "1");
+    }
+
+    #[test]
+    fn bind_bot_statistics_resets_on_account_switch() {
+        let mut stats = BotsStatistics::default();
+        stats.bots.insert("1".into(), loses(4));
+        stats.career.insert("1".into(), CareerRecord { wins: 1, losses: 6 });
+        assert!(bind_bot_statistics_account(&mut stats, "1", "account-a"));
+        assert_eq!(stats.bots.get("1").unwrap().len(), 4);
+        assert_eq!(stats.career.get("1").unwrap().losses, 6);
+
+        assert!(!bind_bot_statistics_account(&mut stats, "1", "account-a"));
+
+        assert!(bind_bot_statistics_account(&mut stats, "1", "account-b"));
+        assert!(stats.bots.get("1").unwrap().is_empty());
+        assert_eq!(stats.career.get("1").unwrap().wins, 0);
+        assert_eq!(stats.career.get("1").unwrap().losses, 0);
+        assert_eq!(stats.active_dota_ids.get("1").unwrap(), "account-b");
     }
 }
