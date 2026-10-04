@@ -68,7 +68,6 @@ Full reference in `src/main.rs` header comment.
 ## Persistence
 
 - `bots_statistics.json` — per-bot match results
-- `bots_play_time.json` — cumulative play time per account
 
 ## Related repos
 

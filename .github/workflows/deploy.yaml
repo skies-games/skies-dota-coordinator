@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [otel-direct-backends]
+    branches: [main]
 
 env:
   SSH_USER: root
@@ -20,8 +20,8 @@ jobs:
           password: ${{ secrets.SSH_PASSWORD }}
           script: |
             cd "${{ env.DEPLOY_PATH }}"
-            git fetch origin otel-direct-backends
-            git reset --hard origin/otel-direct-backends
+            git fetch origin main
+            git reset --hard origin/main
             cargo build --release
             systemctl restart coordinator.service
             systemctl is-active --quiet coordinator.service

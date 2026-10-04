@@ -97,16 +97,6 @@ fn operation_duration() -> &'static Histogram<f64> {
 	})
 }
 
-fn bot_play_time_minutes() -> &'static Gauge<f64> {
-	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
-	GAUGE.get_or_init(|| {
-		global::meter("coordinator")
-			.f64_gauge("coordinator.bot.play_time.minutes")
-			.with_unit("min")
-			.build()
-	})
-}
-
 fn bot_matches_played() -> &'static Gauge<f64> {
 	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
 	GAUGE.get_or_init(|| {
@@ -124,17 +114,6 @@ fn bot_winrate() -> &'static Gauge<f64> {
 			.with_unit("%")
 			.build()
 	})
-}
-
-/// Current cumulative play time for a bot account.
-pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64) {
-	bot_play_time_minutes().record(
-		total_minutes as f64,
-		&[
-			KeyValue::new("bot_number", bot_number.to_string()),
-			KeyValue::new("dota_id", dota_id.to_string()),
-		],
-	);
 }
 
 /// Career matches + winrate (%) for a bot number.
