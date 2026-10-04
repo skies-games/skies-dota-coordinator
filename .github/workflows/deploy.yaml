@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [instrumented]
 
 env:
   SSH_USER: root
@@ -22,8 +22,8 @@ jobs:
             set -euo pipefail
             source "$HOME/.cargo/env"
             cd "${{ env.DEPLOY_PATH }}"
-            git fetch origin main
-            git reset --hard origin/main
+            git fetch origin instrumented
+            git reset --hard origin/instrumented
             cargo build --release
             sudo systemctl restart coordinator.service
             systemctl is-active --quiet coordinator.service

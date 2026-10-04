@@ -73,8 +73,6 @@ const LOSE_STREAK_URGENCY_WEIGHT: i32 = 3;
 
 const BOTS_STATISTICS_PATH: &str = "bots_statistics.json";
 const BOTS_STATISTICS_TMP_PATH: &str = "bots_statistics.json.tmp";
-const BOTS_PLAY_TIME_PATH: &str = "bots_play_time.json";
-const BOTS_PLAY_TIME_TMP_PATH: &str = "bots_play_time.json.tmp";
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 struct CareerRecord {
@@ -95,12 +93,6 @@ struct BotsStatistics {
     /// Last known Steam/Dota account per bot_number. Stats are wiped on switch.
     #[serde(default)]
     active_dota_ids: HashMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
-struct BotsPlayTime {
-    #[serde(default)]
-    bots: HashMap<String, HashMap<String, u64>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -590,10 +582,6 @@ async fn load_bots_statistics() -> BotsStatistics {
     load_json_state(BOTS_STATISTICS_PATH, BOTS_STATISTICS_TMP_PATH, "bots statistics").await
 }
 
-async fn load_bots_play_time() -> BotsPlayTime {
-    load_json_state(BOTS_PLAY_TIME_PATH, BOTS_PLAY_TIME_TMP_PATH, "bots play time").await
-}
-
 #[tokio::main]
 async fn main() {
     let app_config = Arc::new(config::Config::build());
@@ -649,16 +637,10 @@ async fn serve_for_producers(
 ) {
     let active_lobbies: Arc<Mutex<HashMap<String, Lobby>>> = Arc::new(Mutex::new(HashMap::new()));
     let bots_statistics: Arc<Mutex<BotsStatistics>> = Arc::new(Mutex::new(load_bots_statistics().await));
-    let bots_play_time: Arc<Mutex<BotsPlayTime>> = Arc::new(Mutex::new(load_bots_play_time().await));
     {
         let stats_guard = bots_statistics.lock().await;
         tracing::info!("Bots statistics loaded: {:?}", &*stats_guard);
         publish_bots_career_metrics(&*stats_guard);
-    }
-    {
-        let play_time_guard = bots_play_time.lock().await;
-        tracing::info!("Bots play time loaded: {:?}", &*play_time_guard);
-        publish_bots_play_time_metrics(&*play_time_guard);
     }
 
     tokio::spawn(serve_for_reconnect_handshake(reconnect_handshake, Arc::clone(&active_lobbies)));
@@ -668,7 +650,6 @@ async fn serve_for_producers(
         game_ended,
         Arc::clone(&active_lobbies),
         Arc::clone(&bots_statistics),
-        Arc::clone(&bots_play_time),
     ));
     tokio::spawn(serve_for_game_aborted(game_aborted, Arc::clone(&active_lobbies), Arc::clone(&app_config)));
     tokio::spawn(serve_for_in_game_event(in_game_event, Arc::clone(&active_lobbies)));
@@ -950,44 +931,6 @@ async fn send_telegram_message(app_config: &config::Config, text: &str) {
     }
 }
 
-/// Credit play time for one reporting bot. Every bot already sends `game_ended`;
-/// first report also removes the lobby / updates stats; later reports still land here.
-async fn update_bots_play_time_after_game(
-    play_time: &mut BotsPlayTime,
-    game_ended: &GameEnded,
-) {
-    let match_minutes = game_ended.match_duration_secs / 60;
-    tracing::info!(%game_ended.bot_number, "Adding {} minutes of play time to bot", &match_minutes);
-    let bot_accounts = play_time.bots.entry(game_ended.bot_number.clone()).or_default();
-    let stale_dota_ids: Vec<String> = bot_accounts
-        .keys()
-        .filter(|dota_id| *dota_id != &game_ended.dota_id)
-        .cloned()
-        .collect();
-    for stale_dota_id in stale_dota_ids {
-        tracing::info!(%game_ended.bot_number, %stale_dota_id, "Bot switched account: removing stale dota_id and resetting play time");
-        bot_accounts.remove(&stale_dota_id);
-    }
-
-    let total_minutes = bot_accounts.entry(game_ended.dota_id.clone()).or_insert(0);
-    *total_minutes += match_minutes;
-    telemetry::record_bot_play_time(&game_ended.bot_number, &game_ended.dota_id, *total_minutes);
-
-    tracing::debug!(%game_ended.lobby_id, "Bots play time after update: {:?}", &play_time);
-}
-
-fn publish_bots_play_time_metrics(play_time: &BotsPlayTime) {
-    for (bot_number, accounts) in &play_time.bots {
-        for (dota_id, total_minutes) in accounts {
-            telemetry::record_bot_play_time(bot_number, dota_id, *total_minutes);
-        }
-    }
-}
-
-async fn save_bots_play_time(play_time: &BotsPlayTime) {
-    save_json_state(play_time, BOTS_PLAY_TIME_PATH, BOTS_PLAY_TIME_TMP_PATH, "bots play time").await;
-}
-
 async fn serve_for_in_game_parameters(
     mut in_game_parameters_rx: Receiver<InGameParameters>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
@@ -1254,7 +1197,6 @@ async fn serve_for_game_ended(
     mut game_ended_rx: Receiver<GameEnded>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
     bots_statistics: Arc<Mutex<BotsStatistics>>,
-    bots_play_time: Arc<Mutex<BotsPlayTime>>,
 ) {
     while let Some(game_ended) = game_ended_rx.recv().await {
         let lobby_id = game_ended.lobby_id.clone();
@@ -1284,12 +1226,8 @@ async fn serve_for_game_ended(
                 update_bots_statistics_after_game(&lobby, &mut *stats_guard);
                 save_bots_statistics(&*stats_guard).await;
             } else {
-                tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, "Lobby already closed; still crediting play time for this bot");
+                tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, "Lobby was already reported as game ended");
             }
-            // Every bot sends game_ended with its own dota_id + clock_time — credit each.
-            let mut play_time_guard = bots_play_time.lock().await;
-            update_bots_play_time_after_game(&mut *play_time_guard, &game_ended).await;
-            save_bots_play_time(&*play_time_guard).await;
         }
         .instrument(tracing::info_span!("serve_game_ended", %lobby_id, %bot_number))
         .await;
