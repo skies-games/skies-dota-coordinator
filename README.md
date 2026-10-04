@@ -32,15 +32,15 @@ APP_VERSION=0.1.0
 DEPLOYMENT_ENV=dev
 
 # Logs → OpenObserve. Credentials = base64(email:password)
-OPENOBSERVE_ENDPOINT=https://openobserve-test.skiesdota.com/api/default/v1/logs
+OPENOBSERVE_ENDPOINT=https://openobserve.example.com/api/default/v1/logs
 OPENOBSERVE_CREDENTIALS=
 
 # Traces → Tempo. Credentials = base64(user:pass) for Traefik basic auth
-TEMPO_ENDPOINT=https://tempo.skiesdota.com/v1/traces
+TEMPO_ENDPOINT=https://tempo.example.com/v1/traces
 TEMPO_CREDENTIALS=
 
 # Metrics → VictoriaMetrics OTLP (not /prometheus). Credentials = base64(user:pass)
-VICTORIA_METRICS_ENDPOINT=https://victoria-metrics.skiesdota.com/insert/0/opentelemetry/v1/metrics
+VICTORIA_METRICS_ENDPOINT=https://victoria-metrics.example.com/insert/0/opentelemetry/v1/metrics
 VICTORIA_METRICS_CREDENTIALS=
 ```
 
