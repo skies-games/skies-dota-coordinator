@@ -107,7 +107,26 @@ fn bot_play_time_minutes() -> &'static Gauge<f64> {
 	})
 }
 
-/// Current cumulative play time for a bot account → OTLP metrics backend
+fn bot_matches_played() -> &'static Gauge<f64> {
+	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
+	GAUGE.get_or_init(|| {
+		global::meter("coordinator")
+			.f64_gauge("coordinator.bot.matches")
+			.build()
+	})
+}
+
+fn bot_winrate() -> &'static Gauge<f64> {
+	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
+	GAUGE.get_or_init(|| {
+		global::meter("coordinator")
+			.f64_gauge("coordinator.bot.winrate")
+			.with_unit("%")
+			.build()
+	})
+}
+
+/// Current cumulative play time for a bot account.
 pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64) {
 	bot_play_time_minutes().record(
 		total_minutes as f64,
@@ -116,6 +135,19 @@ pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64)
 			KeyValue::new("dota_id", dota_id.to_string()),
 		],
 	);
+}
+
+/// Career matches + winrate (%) for a bot number.
+pub fn record_bot_career(bot_number: &str, wins: u64, losses: u64) {
+	let attrs = [KeyValue::new("bot_number", bot_number.to_string())];
+	let played = wins + losses;
+	bot_matches_played().record(played as f64, &attrs);
+	let winrate = if played == 0 {
+		0.0
+	} else {
+		(wins as f64 / played as f64) * 100.0
+	};
+	bot_winrate().record(winrate, &attrs);
 }
 
 fn resource(config: &Config) -> Resource {
