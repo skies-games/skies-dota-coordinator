@@ -23,14 +23,25 @@ TELEGRAM_CHAT_ID=
 VK_TOKEN=
 VK_PEER_ID=
 
-# OTLP gRPC → cluster otel-collector (traces→Tempo, metrics→VM, logs→O2)
+# Telemetry (OTLP/HTTP direct — no otel-collector)
 OTEL_SERVICE_NAME=skiesdota-coordinator
-OTEL_EXPORTER_OTLP_ENDPOINT=http://gateway-opentelemetry-collector.otel-collector.svc.cluster.local:4317
 OTEL_TRACES_ENABLED=true
 OTEL_METRICS_ENABLED=true
 OTEL_LOGS_ENABLED=true
 APP_VERSION=0.1.0
 DEPLOYMENT_ENV=dev
+
+# Logs → OpenObserve. Credentials = base64(email:password)
+OPENOBSERVE_ENDPOINT=https://openobserve-test.skiesdota.com/api/default/v1/logs
+OPENOBSERVE_CREDENTIALS=
+
+# Traces → Tempo. Credentials = base64(user:pass) for Traefik basic auth
+TEMPO_ENDPOINT=https://tempo.skiesdota.com/v1/traces
+TEMPO_CREDENTIALS=
+
+# Metrics → VictoriaMetrics OTLP (not /prometheus). Credentials = base64(user:pass)
+VICTORIA_METRICS_ENDPOINT=https://victoria-metrics.skiesdota.com/insert/0/opentelemetry/v1/metrics
+VICTORIA_METRICS_CREDENTIALS=
 ```
 
 ## Run
@@ -57,7 +68,6 @@ Full reference in `src/main.rs` header comment.
 ## Persistence
 
 - `bots_statistics.json` — per-bot match results
-- `bots_play_time.json` — cumulative play time per account
 
 ## Related repos
 
