@@ -66,6 +66,8 @@ const CHANNEL_CAP_COLD: usize = 256;
 const CHANNEL_CAP_COMMAND: usize = 32;
 const CHANNEL_CAP_FULLNESS: usize = 16;
 
+const MATCH_RESULT_BUFFER_LEN: usize = 10;
+
 const BOTS_STATISTICS_PATH: &str = "bots_statistics.json";
 const BOTS_STATISTICS_TMP_PATH: &str = "bots_statistics.json.tmp";
 const BOTS_PLAY_TIME_PATH: &str = "bots_play_time.json";
@@ -753,7 +755,7 @@ fn publish_bots_career_metrics(stats: &BotsStatistics) {
 }
 
 fn push_match_result(results: &mut Vec<MatchResult>, result: MatchResult) {
-    if results.len() == 10 {
+    if results.len() == MATCH_RESULT_BUFFER_LEN {
         results.remove(0);
     }
     results.push(result);
