@@ -753,7 +753,7 @@ fn publish_bots_career_metrics(stats: &BotsStatistics) {
 }
 
 fn push_match_result(results: &mut Vec<MatchResult>, result: MatchResult) {
-    if results.len() == 4 {
+    if results.len() == 10 {
         results.remove(0);
     }
     results.push(result);
