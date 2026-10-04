@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [instrumented]
+    branches: [otel-collector]
 
 env:
   SSH_USER: root
@@ -22,8 +22,8 @@ jobs:
             set -euo pipefail
             source "$HOME/.cargo/env"
             cd "${{ env.DEPLOY_PATH }}"
-            git fetch origin instrumented
-            git reset --hard origin/instrumented
+            git fetch origin otel-collector
+            git reset --hard origin/otel-collector
             cargo build --release
             sudo systemctl restart coordinator.service
             systemctl is-active --quiet coordinator.service
