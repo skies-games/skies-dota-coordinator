@@ -72,9 +72,21 @@ const BOTS_PLAY_TIME_PATH: &str = "bots_play_time.json";
 const BOTS_PLAY_TIME_TMP_PATH: &str = "bots_play_time.json.tmp";
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+struct CareerRecord {
+    #[serde(default)]
+    wins: u64,
+    #[serde(default)]
+    losses: u64,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 struct BotsStatistics {
+    /// Last few results — used only for ongoing win-team streak scoring.
     #[serde(default)]
     bots: HashMap<String, Vec<MatchResult>>,
+    /// Cumulative career W/L for metrics (survives the streak window trim).
+    #[serde(default)]
+    career: HashMap<String, CareerRecord>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -542,7 +554,11 @@ async fn serve_for_producers(
     let active_lobbies: Arc<Mutex<HashMap<String, Lobby>>> = Arc::new(Mutex::new(HashMap::new()));
     let bots_statistics: Arc<Mutex<BotsStatistics>> = Arc::new(Mutex::new(load_bots_statistics().await));
     let bots_play_time: Arc<Mutex<BotsPlayTime>> = Arc::new(Mutex::new(load_bots_play_time().await));
-    tracing::info!("Bots statistics loaded: {:?}", bots_statistics.lock().await);
+    {
+        let stats_guard = bots_statistics.lock().await;
+        tracing::info!("Bots statistics loaded: {:?}", &*stats_guard);
+        publish_bots_career_metrics(&*stats_guard);
+    }
     {
         let play_time_guard = bots_play_time.lock().await;
         tracing::info!("Bots play time loaded: {:?}", &*play_time_guard);
@@ -720,8 +736,20 @@ fn update_bots_statistics_after_game(lobby: &Lobby, stats: &mut BotsStatistics) 
         let result = if side == &win_team { MatchResult::Win } else { MatchResult::Lose };
         let bot_results = stats.bots.entry(bot_number.clone()).or_default();
         push_match_result(bot_results, result);
+        let career = stats.career.entry(bot_number.clone()).or_default();
+        match result {
+            MatchResult::Win => career.wins += 1,
+            MatchResult::Lose => career.losses += 1,
+        }
+        telemetry::record_bot_career(bot_number, career.wins, career.losses);
     }
     tracing::debug!("Bots statistics after update: {:?}", &stats);
+}
+
+fn publish_bots_career_metrics(stats: &BotsStatistics) {
+    for (bot_number, career) in &stats.career {
+        telemetry::record_bot_career(bot_number, career.wins, career.losses);
+    }
 }
 
 fn push_match_result(results: &mut Vec<MatchResult>, result: MatchResult) {

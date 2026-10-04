@@ -45,7 +45,6 @@ impl Drop for OtelGuard {
 	}
 }
 
-/// Records `coordinator.operations.duration` (ms) on drop — same idea as Python's histogram.
 ///
 /// Defaults to `success`. Call [`error`](Self::error) on every failure path before return.
 /// Panics are recorded as `error`.
@@ -108,12 +107,35 @@ fn bot_play_time_minutes() -> &'static Gauge<f64> {
 	})
 }
 
+fn bot_matches_played() -> &'static Gauge<f64> {
+	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
+	GAUGE.get_or_init(|| {
+		global::meter("coordinator")
+			.f64_gauge("coordinator.bot.matches")
+			.build()
+	})
+}
+
+fn bot_winrate() -> &'static Gauge<f64> {
+	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
+	GAUGE.get_or_init(|| {
+		global::meter("coordinator")
+			.f64_gauge("coordinator.bot.winrate")
+			.with_unit("%")
+			.build()
+	})
+}
+
 fn match_duration_minutes() -> &'static Histogram<f64> {
 	static HIST: OnceLock<Histogram<f64>> = OnceLock::new();
 	HIST.get_or_init(|| {
+		// Minutes — default OTel ms-oriented buckets are useless here.
 		global::meter("coordinator")
 			.f64_histogram("coordinator.match.duration")
 			.with_unit("min")
+			.with_boundaries(vec![
+				5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 75.0, 90.0,
+			])
 			.build()
 	})
 }
@@ -127,6 +149,19 @@ pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64)
 			KeyValue::new("dota_id", dota_id.to_string()),
 		],
 	);
+}
+
+/// Career matches + winrate (%) for a bot number.
+pub fn record_bot_career(bot_number: &str, wins: u64, losses: u64) {
+	let attrs = [KeyValue::new("bot_number", bot_number.to_string())];
+	let played = wins + losses;
+	bot_matches_played().record(played as f64, &attrs);
+	let winrate = if played == 0 {
+		0.0
+	} else {
+		(wins as f64 / played as f64) * 100.0
+	};
+	bot_winrate().record(winrate, &attrs);
 }
 
 /// Per-match duration (minutes, float) from game-ended payloads.
