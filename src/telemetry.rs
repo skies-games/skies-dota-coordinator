@@ -126,21 +126,7 @@ fn bot_winrate() -> &'static Gauge<f64> {
 	})
 }
 
-fn match_duration_minutes() -> &'static Histogram<f64> {
-	static HIST: OnceLock<Histogram<f64>> = OnceLock::new();
-	HIST.get_or_init(|| {
-		// Minutes — default OTel ms-oriented buckets are useless here.
-		global::meter("coordinator")
-			.f64_histogram("coordinator.match.duration")
-			.with_unit("min")
-			.with_boundaries(vec![
-				5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 75.0, 90.0,
-			])
-			.build()
-	})
-}
-
-/// Current cumulative play time for a bot account → OTLP metrics backend
+/// Current cumulative play time for a bot account.
 pub fn record_bot_play_time(bot_number: &str, dota_id: &str, total_minutes: u64) {
 	bot_play_time_minutes().record(
 		total_minutes as f64,
@@ -162,17 +148,6 @@ pub fn record_bot_career(bot_number: &str, wins: u64, losses: u64) {
 		(wins as f64 / played as f64) * 100.0
 	};
 	bot_winrate().record(winrate, &attrs);
-}
-
-/// Per-match duration (minutes, float) from game-ended payloads.
-pub fn record_match_duration(bot_number: &str, dota_id: &str, duration_secs: u64) {
-	match_duration_minutes().record(
-		duration_secs as f64 / 60.0,
-		&[
-			KeyValue::new("bot_number", bot_number.to_string()),
-			KeyValue::new("dota_id", dota_id.to_string()),
-		],
-	);
 }
 
 fn resource(config: &Config) -> Resource {
