@@ -1132,18 +1132,30 @@ async fn serve_for_reconnect_handshake(
 ) {
     while let Some(reconnect_handshake) = reconnect_handshake_rx.recv().await {
         tracing::info!(%reconnect_handshake.lobby_id, %reconnect_handshake.bot_number, %reconnect_handshake.side, "The servant of reconnect handshake received a message");
-        let mut active_lobbies_guard = active_lobbies.lock().await;
-        if !active_lobbies_guard.contains_key(&reconnect_handshake.lobby_id) {
-            tracing::info!(%reconnect_handshake.lobby_id, %reconnect_handshake.bot_number, "Recreating the lobby for the bot");
-            active_lobbies_guard.insert(reconnect_handshake.lobby_id.clone(), Lobby::new(None));
-            fully_init_lobby(active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id).unwrap()).await;
+        let writer = Arc::clone(&reconnect_handshake.tcp_writer);
+        let should_rejoin = {
+            let mut active_lobbies_guard = active_lobbies.lock().await;
+            if !active_lobbies_guard.contains_key(&reconnect_handshake.lobby_id) {
+                tracing::info!(
+                    %reconnect_handshake.lobby_id,
+                    %reconnect_handshake.bot_number,
+                    "Lobby gone on reconnect — notifying bot game ended"
+                );
+                false
+            } else {
+                let lobby = active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id).unwrap();
+                tracing::info!(%reconnect_handshake.bot_number, %reconnect_handshake.lobby_id, "Bot re-joined the lobby");
+                lobby.bots.insert(
+                    reconnect_handshake.bot_number,
+                    Bot::new(Arc::clone(&writer), Some(reconnect_handshake.side)),
+                );
+                true
+            }
+        };
+        if !should_rejoin {
+            // "80" — game ended (trailing digit passes client keep-alive filter)
+            write_to_bot(&writer, "80".as_bytes()).await;
         }
-        let lobby = active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id).unwrap();
-        tracing::info!(%reconnect_handshake.bot_number, %reconnect_handshake.lobby_id, "Bot re-joined the lobby");
-        lobby.bots.insert(
-            reconnect_handshake.bot_number,
-            Bot::new(Arc::clone(&reconnect_handshake.tcp_writer), Some(reconnect_handshake.side)),
-        );
     }
 }
 
@@ -1404,7 +1416,7 @@ async fn handle_bot_source(
         "inbound message"
     );
     match BotSourceEvent::from_str(event) {
-        BotSourceEvent::ReconnectHandshake => handle_reconnect_handshake(payload, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
+        BotSourceEvent::ReconnectHandshake => handle_reconnect_handshake(payload, Arc::clone(&tcp_writer), Arc::clone(&senders), Arc::clone(&bot_clients)).await,
         BotSourceEvent::LobbyFound => handle_lobby_found(payload, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
         BotSourceEvent::InGameParameters => handle_in_game_parameters(payload, Arc::clone(&tcp_writer), Arc::clone(&senders)).await,
         BotSourceEvent::GameEnded => handle_game_ended(payload, Arc::clone(&senders)).await,
@@ -1532,11 +1544,12 @@ async fn handle_in_game_parameters(
     }
 }
 
-#[tracing::instrument(name = "handle_reconnect_handshake", skip(tcp_writer, senders))]
+#[tracing::instrument(name = "handle_reconnect_handshake", skip(tcp_writer, senders, bot_clients))]
 async fn handle_reconnect_handshake(
     payload: &str,
     tcp_writer: Arc<Mutex<OwnedWriteHalf>>,
     senders: Arc<Senders>,
+    bot_clients: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
 ) {
     let mut timer = telemetry::OpTimer::start("handle_reconnect_handshake");
     let reconnect_handshake = match ReconnectHandshake::try_parse(payload, Arc::clone(&tcp_writer)) {
@@ -1547,6 +1560,8 @@ async fn handle_reconnect_handshake(
             return;
         }
     };
+    bot_clients.lock().await.insert(reconnect_handshake.bot_number.clone(), Arc::clone(&tcp_writer));
+    tracing::info!(%reconnect_handshake.bot_number, "Bot registered via reconnect handshake");
     tracing::info!(%reconnect_handshake.bot_number, %reconnect_handshake.lobby_id, "Sending the reconnect handshake to the receiver");
     if let Err(_) = senders.reconnect_handshake.send(reconnect_handshake).await {
         timer.error();
