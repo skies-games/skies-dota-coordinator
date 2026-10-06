@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use opentelemetry::metrics::{Gauge, Histogram};
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -97,6 +97,16 @@ fn operation_duration() -> &'static Histogram<f64> {
 	})
 }
 
+fn bot_play_time_minutes() -> &'static Counter<f64> {
+	static COUNTER: OnceLock<Counter<f64>> = OnceLock::new();
+	COUNTER.get_or_init(|| {
+		global::meter("coordinator")
+			.f64_counter("coordinator.bot.play_time.minutes")
+			.with_unit("min")
+			.build()
+	})
+}
+
 fn bot_matches_played() -> &'static Gauge<f64> {
 	static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
 	GAUGE.get_or_init(|| {
@@ -114,6 +124,14 @@ fn bot_winrate() -> &'static Gauge<f64> {
 			.with_unit("%")
 			.build()
 	})
+}
+
+/// Add match play minutes for a bot → VictoriaMetrics (no local persistence).
+pub fn add_bot_play_time(bot_number: &str, minutes: f64) {
+	bot_play_time_minutes().add(
+		minutes,
+		&[KeyValue::new("bot_number", bot_number.to_string())],
+	);
 }
 
 /// Career matches + winrate (%) for a bot number.

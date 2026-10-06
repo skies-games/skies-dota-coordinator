@@ -870,6 +870,15 @@ async fn save_bots_statistics(stats: &BotsStatistics) {
     save_json_state(stats, BOTS_STATISTICS_PATH, BOTS_STATISTICS_TMP_PATH, "bots statistics").await;
 }
 
+/// Credit the same match duration to every bot in the lobby (same cadence as career matches).
+fn add_lobby_play_time(lobby: &Lobby, match_duration_secs: u64) {
+    let match_minutes = match_duration_secs as f64 / 60.0;
+    tracing::info!(%match_minutes, bots = lobby.bots.len(), "Adding play time to all bots in lobby");
+    for bot_number in lobby.bots.keys() {
+        telemetry::add_bot_play_time(bot_number, match_minutes);
+    }
+}
+
 async fn send_vk_message(app_config: &config::Config, text: &str) {
     let random_id = rand::rng().random_range(1..999_999_999);
     let mut url = reqwest::Url::parse("https://api.vk.com/method/messages.send")
@@ -1237,6 +1246,7 @@ async fn serve_for_game_ended(
                 let mut stats_guard = bots_statistics.lock().await;
                 update_bots_statistics_after_game(&lobby, &mut *stats_guard);
                 save_bots_statistics(&*stats_guard).await;
+                add_lobby_play_time(&lobby, game_ended.match_duration_secs);
             } else {
                 tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, "Lobby was already reported as game ended");
             }
