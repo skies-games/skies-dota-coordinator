@@ -966,7 +966,14 @@ async fn serve_for_in_game_parameters(
         }
 
         let mut active_lobbies_guard = active_lobbies.lock().await;
-        let lobby = active_lobbies_guard.get_mut(&in_game_parameters.lobby_id).unwrap();
+        let Some(lobby) = active_lobbies_guard.get_mut(&in_game_parameters.lobby_id) else {
+            tracing::error!(
+                %in_game_parameters.lobby_id,
+                %in_game_parameters.bot_number,
+                "Lobby not found for in-game parameters; skipping"
+            );
+            continue;
+        };
         let (roles_payload, replay_payload, notify, spawn_receiver) = if lobby.in_game_parameters_fullness_controller_sender.is_some() {
             tracing::info!(%in_game_parameters.lobby_id, %in_game_parameters.bot_number, %in_game_parameters.side, "In-game parameters fullness controller sender is already set, notifying it");
             lobby.bots.get_mut(&in_game_parameters.bot_number).unwrap().side = Some(in_game_parameters.side.clone());
