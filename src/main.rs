@@ -1155,7 +1155,7 @@ async fn serve_for_reconnect_handshake(
                 tracing::info!(
                     %reconnect_handshake.lobby_id,
                     %reconnect_handshake.bot_number,
-                    "Lobby gone on reconnect — notifying bot game ended"
+                    "Lobby gone on reconnect — notifying bot to leave"
                 );
                 false
             } else {
@@ -1169,8 +1169,9 @@ async fn serve_for_reconnect_handshake(
             }
         };
         if !should_rejoin {
-            // "80" — game ended (trailing digit passes client keep-alive filter)
-            write_to_bot(&writer, "80".as_bytes()).await;
+            // Lobby absent (aborted or ended). "70" = game aborted — leave without
+            // claiming a completed match. Trailing digit passes client keep-alive filter.
+            write_to_bot(&writer, "70".as_bytes()).await;
         }
     }
 }
