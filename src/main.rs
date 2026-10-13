@@ -80,6 +80,9 @@ struct CareerRecord {
     wins: u64,
     #[serde(default)]
     losses: u64,
+    /// Cumulative play minutes for the active Dota account (reset on account switch).
+    #[serde(default)]
+    play_time_minutes: f64,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -794,8 +797,13 @@ async fn serve_for_in_game_event(
     tracing::info!("Servant of in-game-event stopped");
 }
 
-fn update_bots_statistics_after_game(lobby: &Lobby, stats: &mut BotsStatistics) {
+fn update_bots_statistics_after_game(
+    lobby: &Lobby,
+    stats: &mut BotsStatistics,
+    match_duration_secs: u64,
+) {
     tracing::debug!("Bots statistics before update: {:?}", &stats);
+    let match_minutes = match_duration_secs as f64 / 60.0;
     let win_team = match lobby.ongoing_win_team.as_ref() {
         Some(team) => team.clone(),
         None => {
@@ -818,7 +826,9 @@ fn update_bots_statistics_after_game(lobby: &Lobby, stats: &mut BotsStatistics) 
             MatchResult::Win => career.wins += 1,
             MatchResult::Lose => career.losses += 1,
         }
+        career.play_time_minutes += match_minutes;
         telemetry::record_bot_career(bot_number, career.wins, career.losses);
+        telemetry::record_bot_play_time(bot_number, career.play_time_minutes);
     }
     tracing::debug!("Bots statistics after update: {:?}", &stats);
 }
@@ -826,6 +836,7 @@ fn update_bots_statistics_after_game(lobby: &Lobby, stats: &mut BotsStatistics) 
 fn publish_bots_career_metrics(stats: &BotsStatistics) {
     for (bot_number, career) in &stats.career {
         telemetry::record_bot_career(bot_number, career.wins, career.losses);
+        telemetry::record_bot_play_time(bot_number, career.play_time_minutes);
     }
 }
 
@@ -856,6 +867,7 @@ fn bind_bot_statistics_account(stats: &mut BotsStatistics, bot_number: &str, dot
             stats.career.insert(bot_number.to_string(), CareerRecord::default());
             stats.active_dota_ids.insert(bot_number.to_string(), dota_id.to_string());
             telemetry::record_bot_career(bot_number, 0, 0);
+            telemetry::record_bot_play_time(bot_number, 0.0);
             true
         }
         None => {
@@ -868,15 +880,6 @@ fn bind_bot_statistics_account(stats: &mut BotsStatistics, bot_number: &str, dot
 
 async fn save_bots_statistics(stats: &BotsStatistics) {
     save_json_state(stats, BOTS_STATISTICS_PATH, BOTS_STATISTICS_TMP_PATH, "bots statistics").await;
-}
-
-/// Credit the same match duration to every bot in the lobby (same cadence as career matches).
-fn add_lobby_play_time(lobby: &Lobby, match_duration_secs: u64) {
-    let match_minutes = match_duration_secs as f64 / 60.0;
-    tracing::info!(%match_minutes, bots = lobby.bots.len(), "Adding play time to all bots in lobby");
-    for bot_number in lobby.bots.keys() {
-        telemetry::add_bot_play_time(bot_number, match_minutes);
-    }
 }
 
 async fn send_vk_message(app_config: &config::Config, text: &str) {
@@ -1252,9 +1255,12 @@ async fn serve_for_game_ended(
                     .collect();
                 write_to_bots(writers, "80".as_bytes()).await;
                 let mut stats_guard = bots_statistics.lock().await;
-                update_bots_statistics_after_game(&lobby, &mut *stats_guard);
+                update_bots_statistics_after_game(
+                    &lobby,
+                    &mut *stats_guard,
+                    game_ended.match_duration_secs,
+                );
                 save_bots_statistics(&*stats_guard).await;
-                add_lobby_play_time(&lobby, game_ended.match_duration_secs);
             } else {
                 tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, "Lobby was already reported as game ended");
             }
@@ -1728,7 +1734,14 @@ mod win_team_tests {
     fn bind_bot_statistics_resets_on_account_switch() {
         let mut stats = BotsStatistics::default();
         stats.bots.insert("1".into(), loses(4));
-        stats.career.insert("1".into(), CareerRecord { wins: 1, losses: 6 });
+        stats.career.insert(
+            "1".into(),
+            CareerRecord {
+                wins: 1,
+                losses: 6,
+                play_time_minutes: 120.0,
+            },
+        );
         assert!(bind_bot_statistics_account(&mut stats, "1", "account-a"));
         assert_eq!(stats.bots.get("1").unwrap().len(), 4);
         assert_eq!(stats.career.get("1").unwrap().losses, 6);
@@ -1739,6 +1752,7 @@ mod win_team_tests {
         assert!(stats.bots.get("1").unwrap().is_empty());
         assert_eq!(stats.career.get("1").unwrap().wins, 0);
         assert_eq!(stats.career.get("1").unwrap().losses, 0);
+        assert_eq!(stats.career.get("1").unwrap().play_time_minutes, 0.0);
         assert_eq!(stats.active_dota_ids.get("1").unwrap(), "account-b");
     }
 }
