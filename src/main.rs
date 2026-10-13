@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::process::exit;
 use std::net::SocketAddr;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use coordinator::config;
 use coordinator::telemetry;
@@ -73,6 +73,47 @@ const LOSE_STREAK_URGENCY_WEIGHT: i32 = 3;
 
 const BOTS_STATISTICS_PATH: &str = "bots_statistics.json";
 const BOTS_STATISTICS_TMP_PATH: &str = "bots_statistics.json.tmp";
+const OUTDATED_LOBBIES_PATH: &str = "outdated_lobbies.json";
+const OUTDATED_LOBBIES_TMP_PATH: &str = "outdated_lobbies.json.tmp";
+/// FIFO cap for closed lobbies remembered across reconnect / coordinator restart.
+const OUTDATED_LOBBIES_CAP: usize = 100;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum OutdatedLobbyReason {
+    Aborted,
+    Ended,
+}
+
+/// Closed lobby_id → reason, FIFO-capped. `order` is only for eviction; lookup uses `lobbies`.
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+struct OutdatedLobbies {
+    #[serde(default)]
+    lobbies: HashMap<String, OutdatedLobbyReason>,
+    #[serde(default)]
+    order: VecDeque<String>,
+}
+
+impl OutdatedLobbies {
+    fn insert(&mut self, lobby_id: &str, reason: OutdatedLobbyReason) {
+        // Duplicate abort/end reports: keep first FIFO position, do not re-push.
+        if self.lobbies.contains_key(lobby_id) {
+            return;
+        }
+        while self.order.len() >= OUTDATED_LOBBIES_CAP {
+            if let Some(evicted) = self.order.pop_front() {
+                self.lobbies.remove(&evicted);
+            }
+        }
+        let lobby_id = lobby_id.to_string();
+        self.lobbies.insert(lobby_id.clone(), reason);
+        self.order.push_back(lobby_id);
+    }
+
+    fn get(&self, lobby_id: &str) -> Option<OutdatedLobbyReason> {
+        self.lobbies.get(lobby_id).copied()
+    }
+}
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 struct CareerRecord {
@@ -585,6 +626,24 @@ async fn load_bots_statistics() -> BotsStatistics {
     load_json_state(BOTS_STATISTICS_PATH, BOTS_STATISTICS_TMP_PATH, "bots statistics").await
 }
 
+async fn load_outdated_lobbies() -> OutdatedLobbies {
+    load_json_state(OUTDATED_LOBBIES_PATH, OUTDATED_LOBBIES_TMP_PATH, "outdated lobbies").await
+}
+
+async fn save_outdated_lobbies(state: &OutdatedLobbies) {
+    save_json_state(state, OUTDATED_LOBBIES_PATH, OUTDATED_LOBBIES_TMP_PATH, "outdated lobbies").await;
+}
+
+async fn remember_outdated_lobby(
+    outdated_lobbies: &Mutex<OutdatedLobbies>,
+    lobby_id: &str,
+    reason: OutdatedLobbyReason,
+) {
+    let mut guard = outdated_lobbies.lock().await;
+    guard.insert(lobby_id, reason);
+    save_outdated_lobbies(&*guard).await;
+}
+
 #[tokio::main]
 async fn main() {
     let app_config = Arc::new(config::Config::build());
@@ -640,21 +699,41 @@ async fn serve_for_producers(
 ) {
     let active_lobbies: Arc<Mutex<HashMap<String, Lobby>>> = Arc::new(Mutex::new(HashMap::new()));
     let bots_statistics: Arc<Mutex<BotsStatistics>> = Arc::new(Mutex::new(load_bots_statistics().await));
+    let outdated_lobbies: Arc<Mutex<OutdatedLobbies>> =
+        Arc::new(Mutex::new(load_outdated_lobbies().await));
     {
         let stats_guard = bots_statistics.lock().await;
         tracing::info!("Bots statistics loaded: {:?}", &*stats_guard);
         publish_bots_career_metrics(&*stats_guard);
     }
+    {
+        let outdated_guard = outdated_lobbies.lock().await;
+        tracing::info!(
+            count = outdated_guard.order.len(),
+            "Outdated lobbies loaded: {:?}",
+            &*outdated_guard
+        );
+    }
 
-    tokio::spawn(serve_for_reconnect_handshake(reconnect_handshake, Arc::clone(&active_lobbies)));
+    tokio::spawn(serve_for_reconnect_handshake(
+        reconnect_handshake,
+        Arc::clone(&active_lobbies),
+        Arc::clone(&outdated_lobbies),
+    ));
     tokio::spawn(serve_for_lobby_found(lobby_found, Arc::clone(&active_lobbies)));
     tokio::spawn(serve_for_in_game_parameters(in_game_parameters, Arc::clone(&active_lobbies), Arc::clone(&bots_statistics)));
     tokio::spawn(serve_for_game_ended(
         game_ended,
         Arc::clone(&active_lobbies),
         Arc::clone(&bots_statistics),
+        Arc::clone(&outdated_lobbies),
     ));
-    tokio::spawn(serve_for_game_aborted(game_aborted, Arc::clone(&active_lobbies), Arc::clone(&app_config)));
+    tokio::spawn(serve_for_game_aborted(
+        game_aborted,
+        Arc::clone(&active_lobbies),
+        Arc::clone(&outdated_lobbies),
+        Arc::clone(&app_config),
+    ));
     tokio::spawn(serve_for_in_game_event(in_game_event, Arc::clone(&active_lobbies)));
     tokio::spawn(serve_for_user_termination_command(user_command, active_lobbies));
 }
@@ -1145,36 +1224,76 @@ fn compute_ongoing_win_team(lobby: &Lobby, stats: &BotsStatistics) -> String {
     pick_win_side(radiant, dire)
 }
 
+enum ReconnectOutcome {
+    Rejoined,
+    LeaveAborted,
+    LeaveEnded,
+}
+
 async fn serve_for_reconnect_handshake(
     mut reconnect_handshake_rx: Receiver<ReconnectHandshake>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
+    outdated_lobbies: Arc<Mutex<OutdatedLobbies>>,
 ) {
     while let Some(reconnect_handshake) = reconnect_handshake_rx.recv().await {
         tracing::info!(%reconnect_handshake.lobby_id, %reconnect_handshake.bot_number, %reconnect_handshake.side, "The servant of reconnect handshake received a message");
         let writer = Arc::clone(&reconnect_handshake.tcp_writer);
-        let should_rejoin = {
+        let outcome = {
             let mut active_lobbies_guard = active_lobbies.lock().await;
-            if !active_lobbies_guard.contains_key(&reconnect_handshake.lobby_id) {
-                tracing::info!(
-                    %reconnect_handshake.lobby_id,
-                    %reconnect_handshake.bot_number,
-                    "Lobby gone on reconnect — notifying bot to leave"
-                );
-                false
-            } else {
-                let lobby = active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id).unwrap();
+            if let Some(lobby) = active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id) {
                 tracing::info!(%reconnect_handshake.bot_number, %reconnect_handshake.lobby_id, "Bot re-joined the lobby");
                 lobby.bots.insert(
                     reconnect_handshake.bot_number,
                     Bot::new(Arc::clone(&writer), Some(reconnect_handshake.side)),
                 );
-                true
+                ReconnectOutcome::Rejoined
+            } else {
+                let outdated_reason = outdated_lobbies.lock().await.get(&reconnect_handshake.lobby_id);
+                match outdated_reason {
+                    Some(OutdatedLobbyReason::Aborted) => {
+                        tracing::info!(
+                            %reconnect_handshake.lobby_id,
+                            %reconnect_handshake.bot_number,
+                            "Outdated lobby (aborted) on reconnect — notifying bot to leave"
+                        );
+                        ReconnectOutcome::LeaveAborted
+                    }
+                    Some(OutdatedLobbyReason::Ended) => {
+                        tracing::info!(
+                            %reconnect_handshake.lobby_id,
+                            %reconnect_handshake.bot_number,
+                            "Outdated lobby (ended) on reconnect — notifying bot game ended"
+                        );
+                        ReconnectOutcome::LeaveEnded
+                    }
+                    None => {
+                        // Coordinator restart mid-game: rebuild lobby membership from reconnects.
+                        tracing::info!(
+                            %reconnect_handshake.lobby_id,
+                            %reconnect_handshake.bot_number,
+                            "Recreating lobby on reconnect"
+                        );
+                        active_lobbies_guard
+                            .insert(reconnect_handshake.lobby_id.clone(), Lobby::new(None));
+                        fully_init_lobby(
+                            active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id).unwrap(),
+                        )
+                        .await;
+                        let lobby = active_lobbies_guard.get_mut(&reconnect_handshake.lobby_id).unwrap();
+                        lobby.bots.insert(
+                            reconnect_handshake.bot_number,
+                            Bot::new(Arc::clone(&writer), Some(reconnect_handshake.side)),
+                        );
+                        ReconnectOutcome::Rejoined
+                    }
+                }
             }
         };
-        if !should_rejoin {
-            // Lobby absent (aborted or ended). "70" = game aborted — leave without
-            // claiming a completed match. Trailing digit passes client keep-alive filter.
-            write_to_bot(&writer, "70".as_bytes()).await;
+        match outcome {
+            ReconnectOutcome::Rejoined => {}
+            // Trailing digit passes client keep-alive filter.
+            ReconnectOutcome::LeaveAborted => write_to_bot(&writer, "70".as_bytes()).await,
+            ReconnectOutcome::LeaveEnded => write_to_bot(&writer, "80".as_bytes()).await,
         }
     }
 }
@@ -1182,6 +1301,7 @@ async fn serve_for_reconnect_handshake(
 async fn serve_for_game_aborted(
     mut game_aborted_rx: Receiver<GameAborted>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
+    outdated_lobbies: Arc<Mutex<OutdatedLobbies>>,
     app_config: Arc<config::Config>,
 ) {
     while let Some(game_aborted) = game_aborted_rx.recv().await {
@@ -1196,6 +1316,12 @@ async fn serve_for_game_aborted(
             }
             removed
         };
+        remember_outdated_lobby(
+            &*outdated_lobbies,
+            &game_aborted.lobby_id,
+            OutdatedLobbyReason::Aborted,
+        )
+        .await;
         if let Some(lobby) = removed {
             tracing::info!(%game_aborted.lobby_id, %game_aborted.bot_number, "Broadcasting game aborted to all bots in lobby except bot");
             let writers: Vec<_> = lobby.bots.iter()
@@ -1229,6 +1355,7 @@ async fn serve_for_game_ended(
     mut game_ended_rx: Receiver<GameEnded>,
     active_lobbies: Arc<Mutex<HashMap<String, Lobby>>>,
     bots_statistics: Arc<Mutex<BotsStatistics>>,
+    outdated_lobbies: Arc<Mutex<OutdatedLobbies>>,
 ) {
     while let Some(game_ended) = game_ended_rx.recv().await {
         let lobby_id = game_ended.lobby_id.clone();
@@ -1247,6 +1374,12 @@ async fn serve_for_game_ended(
                 }
                 removed
             };
+            remember_outdated_lobby(
+                &*outdated_lobbies,
+                &game_ended.lobby_id,
+                OutdatedLobbyReason::Ended,
+            )
+            .await;
             if let Some(lobby) = removed {
                 tracing::info!(%game_ended.lobby_id, %game_ended.bot_number, "Broadcasting game ended to all bots in lobby except bot");
                 let writers: Vec<_> = lobby.bots.iter()
