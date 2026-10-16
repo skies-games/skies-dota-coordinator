@@ -57,13 +57,9 @@ Deployed to `/root/skies-dota-coordinator` as `coordinator.service` (see `.githu
 
 Length-prefixed TCP messages. Source codes: `0` = bot, `1` = user.
 
-**Bot events:** reconnect_handshake, lobby_found, in_game_parameters, game_ended, game_aborted, in_game_event, connect_handshake
+**Shared codes (both directions):** `5` in_game_event, `7` game_aborted, `8` game_ended.
 
-**Outbound commands:** terminate, lobby_verdict, roles, starter_replay_number, ongoing_win_team, pre_in_game_disconnect, in_game_event, game_aborted
-
-**Roles:** `0` MidLine, `1` HardLine, `2` EasyLine
-
-Full reference in `src/main.rs` header comment.
+Full reference: [PROTOCOL.md](./PROTOCOL.md).
 
 ## Persistence
 

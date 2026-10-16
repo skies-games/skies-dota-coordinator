@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::config::Config;
+
 use opentelemetry::metrics::{Gauge, Histogram};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
@@ -21,8 +23,6 @@ use opentelemetry_sdk::Resource;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-use crate::config::Config;
 
 pub struct OtelGuard {
 	tracer_provider: Option<SdkTracerProvider>,
